@@ -1,1 +1,15 @@
-# garagon-aguara
+# garagon/aguara
+
+Scan AI agent skills and MCP servers for security threats — prompt injection, data exfiltration, tool shadowing, and more.
+
+Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at [https://github.com/garagon/aguara](https://github.com/garagon/aguara).
+
+## Versions
+
+| Version | Tag | Upstream commit |
+|---------|-----|-----------------|
+| v0.22.0 | [`v0.22.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.22.0) | [`e2f5f1a`](https://github.com/garagon/aguara/commit/e2f5f1ae826d8ceba1330eeba16f42f4aa481519) |
+
+## Privacy
+
+This Action contacts Chainguard's licensing server to verify authorization. Connection metadata (IP address, GitHub repository identifier, timestamp, and any metadata encoded in the auth token) is transmitted to Chainguard, Inc. even if authorization is denied in accordance with our [Privacy Notice](https://www.chainguard.dev/legal/privacy-notice)
