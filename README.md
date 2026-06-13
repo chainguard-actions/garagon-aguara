@@ -9,6 +9,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | Version | Tag | Upstream commit |
 |---------|-----|-----------------|
 | v0.22.0 | [`v0.22.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.22.0) | [`e2f5f1a`](https://github.com/garagon/aguara/commit/e2f5f1ae826d8ceba1330eeba16f42f4aa481519) |
+| v0.23.0 | [`v0.23.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.23.0) | [`be225f0`](https://github.com/garagon/aguara/commit/be225f05ccb7c64f06d5f157114c39559e21859f) |
 
 ## Privacy
 
