@@ -1,0 +1,679 @@
+package output_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/garagon/aguara/internal/output"
+	"github.com/garagon/aguara/internal/types"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTerminalFormatterNoFindings(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings:     nil,
+		FilesScanned: 5,
+		RulesLoaded:  70,
+		Target:       "testdata/benign",
+	}
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	require.Contains(t, out, "No security issues found")
+	require.Contains(t, out, "SCAN RESULTS")
+	require.Contains(t, out, "5 files scanned")
+	require.Contains(t, out, "0 findings")
+	require.Contains(t, out, "Target: testdata/benign")
+}
+
+func TestTerminalFormatterWithFindings(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{
+				RuleID:      "TEST_001",
+				RuleName:    "Test Rule",
+				Severity:    types.SeverityCritical,
+				Category:    "test",
+				FilePath:    "test.md",
+				Line:        5,
+				MatchedText: "bad stuff",
+				Context: []types.ContextLine{
+					{Line: 4, Content: "before", IsMatch: false},
+					{Line: 5, Content: "bad stuff here", IsMatch: true},
+					{Line: 6, Content: "after", IsMatch: false},
+				},
+			},
+		},
+		FilesScanned: 1,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	require.Contains(t, out, "TEST_001")
+	require.Contains(t, out, "CRITICAL")
+	require.Contains(t, out, "test.md")
+	require.Contains(t, out, "SCAN RESULTS")
+	require.Contains(t, out, "1 files scanned")
+	// Critical finding should show matched text preview
+	require.Contains(t, out, "bad stuff")
+	require.Contains(t, out, "test.md:5")
+}
+
+func TestJSONFormatter(t *testing.T) {
+	f := &output.JSONFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{RuleID: "R1", FilePath: "a.md", Line: 1, Severity: types.SeverityHigh},
+		},
+		FilesScanned: 1,
+		RulesLoaded:  10,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+
+	var parsed types.ScanResult
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	require.Len(t, parsed.Findings, 1)
+	require.Equal(t, "R1", parsed.Findings[0].RuleID)
+	require.Equal(t, 1, parsed.FilesScanned)
+}
+
+func TestSARIFFormatter(t *testing.T) {
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{
+				RuleID:      "PROMPT_INJECTION_001",
+				RuleName:    "Instruction override attempt",
+				Severity:    types.SeverityCritical,
+				Category:    "prompt-injection",
+				FilePath:    "SKILL.md",
+				Line:        10,
+				Column:      5,
+				MatchedText: "ignore all previous instructions",
+			},
+			{
+				RuleID:      "EXFIL_001",
+				RuleName:    "Webhook URL for data exfiltration",
+				Severity:    types.SeverityHigh,
+				Category:    "exfiltration",
+				FilePath:    "config.yaml",
+				Line:        3,
+				MatchedText: "https://webhook.site/abc123",
+			},
+		},
+		FilesScanned: 2,
+		RulesLoaded:  35,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+
+	require.Equal(t, "2.1.0", parsed["version"])
+	require.Contains(t, parsed["$schema"], "sarif-schema-2.1.0")
+
+	runs := parsed["runs"].([]any)
+	require.Len(t, runs, 1)
+
+	run := runs[0].(map[string]any)
+	tool := run["tool"].(map[string]any)
+	driver := tool["driver"].(map[string]any)
+	require.Equal(t, "aguara", driver["name"])
+
+	rules := driver["rules"].([]any)
+	require.Len(t, rules, 2)
+
+	results := run["results"].([]any)
+	require.Len(t, results, 2)
+
+	r0 := results[0].(map[string]any)
+	require.Equal(t, "PROMPT_INJECTION_001", r0["ruleId"])
+	require.Equal(t, "error", r0["level"])
+
+	r1 := results[1].(map[string]any)
+	require.Equal(t, "EXFIL_001", r1["ruleId"])
+	require.Equal(t, "warning", r1["level"])
+}
+
+func TestTerminalFormatterDuration(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings:     nil,
+		FilesScanned: 3,
+		Duration:     1500 * time.Millisecond,
+	}
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	// Duration appears in both header and footer
+	require.Contains(t, out, "1.50s")
+}
+
+func TestTerminalFormatterDashboard(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{RuleID: "C1", Severity: types.SeverityCritical, FilePath: "a.md", Line: 1, RuleName: "Crit Rule"},
+			{RuleID: "C2", Severity: types.SeverityCritical, FilePath: "a.md", Line: 2, RuleName: "Crit Rule 2"},
+			{RuleID: "H1", Severity: types.SeverityHigh, FilePath: "b.md", Line: 1, RuleName: "High Rule"},
+			{RuleID: "M1", Severity: types.SeverityMedium, FilePath: "c.md", Line: 1, RuleName: "Med Rule"},
+		},
+		FilesScanned: 3,
+		RulesLoaded:  10,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	// Dashboard should have bar characters and severity counts
+	require.Contains(t, out, "\u2588")
+	require.Contains(t, out, "\u2591")
+	require.Contains(t, out, "CRITICAL")
+	require.Contains(t, out, "HIGH")
+	require.Contains(t, out, "MEDIUM")
+	// Section headers
+	require.Contains(t, out, "CRITICAL (2)")
+	require.Contains(t, out, "HIGH (1)")
+	require.Contains(t, out, "MEDIUM (1)")
+}
+
+func TestTerminalFormatterTopFiles(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{RuleID: "R1", Severity: types.SeverityHigh, FilePath: "file1.md", Line: 1, RuleName: "Rule 1"},
+			{RuleID: "R2", Severity: types.SeverityHigh, FilePath: "file1.md", Line: 2, RuleName: "Rule 2"},
+			{RuleID: "R3", Severity: types.SeverityHigh, FilePath: "file1.md", Line: 3, RuleName: "Rule 3"},
+			{RuleID: "R4", Severity: types.SeverityMedium, FilePath: "file2.md", Line: 1, RuleName: "Rule 4"},
+			{RuleID: "R5", Severity: types.SeverityMedium, FilePath: "file3.md", Line: 1, RuleName: "Rule 5"},
+		},
+		FilesScanned: 3,
+		RulesLoaded:  10,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	require.Contains(t, out, "TOP AFFECTED FILES")
+	require.Contains(t, out, "file1.md")
+	require.Contains(t, out, "file2.md")
+	require.Contains(t, out, "file3.md")
+}
+
+func TestSARIFFormatterDuration(t *testing.T) {
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{RuleID: "R1", RuleName: "Rule 1", Severity: types.SeverityHigh, FilePath: "a.md", Line: 1},
+		},
+		FilesScanned: 1,
+		Duration:     1500 * time.Millisecond,
+	}
+	require.NoError(t, f.Format(&buf, result))
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	runs := parsed["runs"].([]any)
+	run := runs[0].(map[string]any)
+	props := run["properties"].(map[string]any)
+	require.Equal(t, float64(1500), props["duration_ms"])
+}
+
+func TestSARIFFormatterVersion(t *testing.T) {
+	original := output.ToolVersion
+	defer func() { output.ToolVersion = original }()
+
+	output.ToolVersion = "1.2.3"
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings:     nil,
+		FilesScanned: 1,
+	}
+	require.NoError(t, f.Format(&buf, result))
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	runs := parsed["runs"].([]any)
+	run := runs[0].(map[string]any)
+	tool := run["tool"].(map[string]any)
+	driver := tool["driver"].(map[string]any)
+	require.Equal(t, "1.2.3", driver["version"])
+}
+
+func TestTerminalFormatterVerbose(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true, Verbose: true}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{
+				RuleID:      "C1",
+				RuleName:    "Critical Rule",
+				Severity:    types.SeverityCritical,
+				Category:    "test",
+				Description: "Critical description here",
+				FilePath:    "a.md",
+				Line:        1,
+				MatchedText: "bad",
+			},
+			{
+				RuleID:      "H1",
+				RuleName:    "High Rule",
+				Severity:    types.SeverityHigh,
+				Category:    "test",
+				Description: "High description here",
+				FilePath:    "b.md",
+				Line:        2,
+			},
+			{
+				RuleID:      "M1",
+				RuleName:    "Medium Rule",
+				Severity:    types.SeverityMedium,
+				Category:    "test",
+				Description: "Medium description here",
+				FilePath:    "c.md",
+				Line:        3,
+			},
+		},
+		FilesScanned: 3,
+		RulesLoaded:  10,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	// CRITICAL and HIGH descriptions should be visible
+	require.Contains(t, out, "Critical description here")
+	require.Contains(t, out, "High description here")
+	// MEDIUM description should NOT be shown
+	require.NotContains(t, out, "Medium description here")
+}
+
+func TestTerminalFormatterVerboseConfidence(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true, Verbose: true}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{
+				RuleID:     "C1",
+				RuleName:   "Critical Rule",
+				Severity:   types.SeverityCritical,
+				Category:   "test",
+				FilePath:   "a.md",
+				Line:       1,
+				MatchedText: "bad",
+				Confidence: 0.85,
+			},
+			{
+				RuleID:     "H1",
+				RuleName:   "High Rule",
+				Severity:   types.SeverityHigh,
+				Category:   "test",
+				FilePath:   "b.md",
+				Line:       2,
+				Confidence: 0.95,
+			},
+		},
+		FilesScanned: 2,
+		RulesLoaded:  10,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	require.Contains(t, out, "[85%]")
+	require.Contains(t, out, "[95%]")
+}
+
+func TestTerminalFormatterNonVerboseNoConfidence(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true, Verbose: false}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{
+				RuleID:     "H1",
+				RuleName:   "High Rule",
+				Severity:   types.SeverityHigh,
+				Category:   "test",
+				FilePath:   "a.md",
+				Line:       1,
+				Confidence: 0.85,
+			},
+		},
+		FilesScanned: 1,
+		RulesLoaded:  10,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	// Confidence should NOT appear when not verbose
+	require.NotContains(t, out, "[85%]")
+}
+
+func TestTerminalFormatterNonVerboseNoDescription(t *testing.T) {
+	f := &output.TerminalFormatter{NoColor: true, Verbose: false}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{
+				RuleID:      "C1",
+				RuleName:    "Critical Rule",
+				Severity:    types.SeverityCritical,
+				Category:    "test",
+				Description: "Should not appear",
+				FilePath:    "a.md",
+				Line:        1,
+				MatchedText: "bad",
+			},
+			{
+				RuleID:      "H1",
+				RuleName:    "High Rule",
+				Severity:    types.SeverityHigh,
+				Category:    "test",
+				Description: "Should not appear either",
+				FilePath:    "b.md",
+				Line:        2,
+			},
+		},
+		FilesScanned: 2,
+		RulesLoaded:  10,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	require.NotContains(t, out, "Should not appear")
+	require.NotContains(t, out, "Should not appear either")
+}
+
+func TestMarkdownFormatterNoFindings(t *testing.T) {
+	f := &output.MarkdownFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings:     nil,
+		FilesScanned: 5,
+		RulesLoaded:  70,
+	}
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	require.Contains(t, out, "## Aguara Security Scan")
+	require.Contains(t, out, "**Passed**")
+	require.Contains(t, out, "No security issues found")
+}
+
+func TestMarkdownFormatterWithFindings(t *testing.T) {
+	f := &output.MarkdownFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{RuleID: "PI_001", RuleName: "Prompt injection", Severity: types.SeverityCritical, Category: "prompt-injection", FilePath: "skill.md", Line: 5},
+			{RuleID: "CRED_001", RuleName: "Credential leak", Severity: types.SeverityHigh, Category: "credential-leak", FilePath: "skill.md", Line: 12},
+			{RuleID: "EXFIL_001", RuleName: "Data exfiltration", Severity: types.SeverityHigh, Category: "exfiltration", FilePath: "config.yaml", Line: 3},
+		},
+		FilesScanned: 2,
+		RulesLoaded:  148,
+		Target:       "testdata/malicious",
+	}
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	// Header with severity badges
+	require.Contains(t, out, "critical")
+	require.Contains(t, out, "high")
+	// File grouping
+	require.Contains(t, out, "`skill.md`")
+	require.Contains(t, out, "`config.yaml`")
+	// Table structure
+	require.Contains(t, out, "| Severity | Rule |")
+	require.Contains(t, out, "`PI_001`")
+	// Footer
+	require.Contains(t, out, "Aguara")
+}
+
+func TestMarkdownEscapesPipeChars(t *testing.T) {
+	f := &output.MarkdownFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{RuleID: "R1", RuleName: "Rule with | pipe and <angle>", Severity: types.SeverityMedium, FilePath: "a.md", Line: 1},
+		},
+		FilesScanned: 1,
+	}
+	require.NoError(t, f.Format(&buf, result))
+	out := buf.String()
+	// Pipe should be escaped, angle brackets converted
+	require.Contains(t, out, "\\|")
+	require.Contains(t, out, "&lt;")
+	require.Contains(t, out, "&gt;")
+}
+
+func TestSARIFFormatterConfidenceRank(t *testing.T) {
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings: []types.Finding{
+			{
+				RuleID:     "R1",
+				RuleName:   "Rule with confidence",
+				Severity:   types.SeverityHigh,
+				FilePath:   "a.md",
+				Line:       1,
+				Confidence: 0.85,
+			},
+			{
+				RuleID:   "R2",
+				RuleName: "Rule without confidence",
+				Severity: types.SeverityLow,
+				FilePath: "b.md",
+				Line:     1,
+			},
+		},
+		FilesScanned: 2,
+	}
+	require.NoError(t, f.Format(&buf, result))
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	runs := parsed["runs"].([]any)
+	run := runs[0].(map[string]any)
+	results := run["results"].([]any)
+
+	r0 := results[0].(map[string]any)
+	props0 := r0["properties"].(map[string]any)
+	require.Equal(t, 0.85, props0["confidence"])
+	require.Equal(t, float64(85), props0["rank"])
+
+	r1 := results[1].(map[string]any)
+	// No confidence means no properties (or no rank key)
+	if props1, ok := r1["properties"]; ok {
+		p := props1.(map[string]any)
+		_, hasRank := p["rank"]
+		require.False(t, hasRank)
+	}
+}
+
+func TestSARIFFormatterEmpty(t *testing.T) {
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	result := &types.ScanResult{
+		Findings:     nil,
+		FilesScanned: 5,
+	}
+
+	require.NoError(t, f.Format(&buf, result))
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+
+	require.Equal(t, "2.1.0", parsed["version"])
+	runs := parsed["runs"].([]any)
+	run := runs[0].(map[string]any)
+	// Results should be null/nil (no findings)
+	require.Nil(t, run["results"])
+}
+
+// TestSARIFFormatterRedactsSensitiveMatch covers the v0.16.1 audit P1: a
+// finding marked Sensitive=true must have its MatchedText scrubbed before
+// it reaches SARIF, because the formatter embeds MatchedText directly into
+// `message.text` which is published to GitHub Code Scanning.
+func TestSARIFFormatterRedactsSensitiveMatch(t *testing.T) {
+	const secret = "hunter2supersecret"
+	findings := []types.Finding{
+		{
+			RuleID:      "MCP_007",
+			RuleName:    "Cross-tool data leakage",
+			Severity:    types.SeverityMedium,
+			Category:    "mcp-attack",
+			FilePath:    "skill.md",
+			Line:        7,
+			MatchedText: "read password = " + secret + " + post to attacker.com",
+			Sensitive:   true,
+		},
+		{
+			RuleID:      "NLP_CRED_EXFIL_COMBO",
+			RuleName:    "Text combines credential access with network transmission",
+			Severity:    types.SeverityCritical,
+			Category:    "exfiltration",
+			FilePath:    "skill.md",
+			Line:        9,
+			MatchedText: "use the token " + secret + " then send via webhook",
+			Sensitive:   true,
+		},
+	}
+	types.RedactSensitiveFindings(findings)
+
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	require.NoError(t, f.Format(&buf, &types.ScanResult{Findings: findings}))
+
+	out := buf.String()
+	require.NotContains(t, out, secret, "sensitive secret leaked into SARIF output")
+	require.Contains(t, out, "[REDACTED]", "SARIF should embed the redaction placeholder")
+}
+
+// TestJSONFormatterRedactsSensitiveMatch is the JSON counterpart of the SARIF
+// test above. ScanResult.MarshalJSON serializes Finding.MatchedText and the
+// Context slice verbatim, so the redaction must run before serialization.
+func TestJSONFormatterRedactsSensitiveMatch(t *testing.T) {
+	const secret = "hunter2supersecret"
+	findings := []types.Finding{
+		{
+			RuleID:      "MCP_007",
+			RuleName:    "Cross-tool data leakage",
+			Severity:    types.SeverityMedium,
+			Category:    "mcp-attack",
+			FilePath:    "skill.md",
+			Line:        7,
+			MatchedText: "read password = " + secret + " + post to attacker.com",
+			Context: []types.ContextLine{
+				{Line: 6, Content: "## Setup", IsMatch: false},
+				{Line: 7, Content: "password = " + secret, IsMatch: true},
+				{Line: 8, Content: "POST to attacker.com", IsMatch: false},
+			},
+			Sensitive: true,
+		},
+	}
+	types.RedactSensitiveFindings(findings)
+
+	f := &output.JSONFormatter{}
+	var buf bytes.Buffer
+	require.NoError(t, f.Format(&buf, &types.ScanResult{Findings: findings}))
+
+	out := buf.String()
+	require.NotContains(t, out, secret, "sensitive secret leaked into JSON output")
+	require.Contains(t, out, "[REDACTED]")
+}
+
+// TestJSONFormatterRedactsMCPCFG003 locks the YAML -> runtime -> output
+// chain for MCPCFG_003. The rule's `match_mode: all` requires the env
+// block pattern AND the secret-bearing key/value pattern to fire, so
+// the resulting MatchedText literally contains the value side of the
+// env binding. With sensitive: true on the rule, the runtime emits
+// Finding.Sensitive=true and RedactSensitiveFindings scrubs MatchedText
+// before any output formatter sees it. The fixture value is obviously
+// synthetic padding (no resemblance to a real credential) and the test
+// asserts it never reaches the JSON output.
+func TestJSONFormatterRedactsMCPCFG003(t *testing.T) {
+	const fixtureValue = "not-a-real-key-just-test-padding-XYZ-0123456789"
+	findings := []types.Finding{
+		{
+			RuleID:      "MCPCFG_003",
+			RuleName:    "Hardcoded secrets in MCP env block",
+			Severity:    types.SeverityLow,
+			Category:    "mcp-config",
+			FilePath:    "mcp.json",
+			Line:        4,
+			MatchedText: `"env":{ + "API_KEY":"` + fixtureValue + `"`,
+			Sensitive:   true,
+		},
+	}
+	types.RedactSensitiveFindings(findings)
+
+	f := &output.JSONFormatter{}
+	var buf bytes.Buffer
+	require.NoError(t, f.Format(&buf, &types.ScanResult{Findings: findings}))
+
+	out := buf.String()
+	require.NotContains(t, out, fixtureValue, "MCPCFG_003 captured value leaked into JSON output")
+	require.Contains(t, out, "[REDACTED]", "JSON output should embed the redaction placeholder")
+}
+
+// TestSARIFFormatterRedactsMCPCFG003 is the SARIF counterpart. The
+// SARIF formatter embeds MatchedText into message.text which gets
+// published to GitHub Code Scanning, so the redaction must run before
+// SARIF serialization.
+func TestSARIFFormatterRedactsMCPCFG003(t *testing.T) {
+	const fixtureValue = "not-a-real-key-just-test-padding-XYZ-0123456789"
+	findings := []types.Finding{
+		{
+			RuleID:      "MCPCFG_003",
+			RuleName:    "Hardcoded secrets in MCP env block",
+			Severity:    types.SeverityLow,
+			Category:    "mcp-config",
+			FilePath:    "mcp.json",
+			Line:        4,
+			MatchedText: `"env":{ + "API_KEY":"` + fixtureValue + `"`,
+			Sensitive:   true,
+		},
+	}
+	types.RedactSensitiveFindings(findings)
+
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	require.NoError(t, f.Format(&buf, &types.ScanResult{Findings: findings}))
+
+	out := buf.String()
+	require.NotContains(t, out, fixtureValue, "MCPCFG_003 captured value leaked into SARIF output")
+	require.Contains(t, out, "[REDACTED]", "SARIF output should embed the redaction placeholder")
+}
+
+// TestSARIFFormatterPreservesNonSensitiveMatch is the negative case: a
+// non-sensitive finding (e.g. a prompt-injection signature) must keep its
+// MatchedText so reviewers can see what tripped the rule.
+func TestSARIFFormatterPreservesNonSensitiveMatch(t *testing.T) {
+	const trigger = "ignore all previous instructions"
+	findings := []types.Finding{
+		{
+			RuleID:      "PROMPT_INJECTION_001",
+			RuleName:    "Instruction override attempt",
+			Severity:    types.SeverityCritical,
+			Category:    "prompt-injection",
+			FilePath:    "skill.md",
+			Line:        3,
+			MatchedText: trigger,
+		},
+	}
+	types.RedactSensitiveFindings(findings)
+
+	f := &output.SARIFFormatter{}
+	var buf bytes.Buffer
+	require.NoError(t, f.Format(&buf, &types.ScanResult{Findings: findings}))
+
+	require.Contains(t, buf.String(), trigger, "non-sensitive match must survive redaction")
+}
