@@ -1,0 +1,193 @@
+name: 'Aguara Security Scanner'
+description: 'Scan AI agent skills and MCP servers for security threats — prompt injection, data exfiltration, tool shadowing, and more.'
+author: 'garagon'
+branding:
+  icon: 'shield'
+  color: 'orange'
+inputs:
+  path:
+    description: 'Path to scan'
+    required: false
+    default: './'
+  severity:
+    description: 'Minimum severity to report: critical, high, medium, low, info'
+    required: false
+    default: 'info'
+  fail-on:
+    description: 'Exit code 1 if findings at or above this severity (critical, high, medium, low)'
+    required: false
+    default: ''
+  format:
+    description: 'Output format: terminal, json, sarif, markdown'
+    required: false
+    default: 'sarif'
+  output:
+    description: 'Output file path'
+    required: false
+    default: 'aguara-results.sarif'
+  verbose:
+    description: 'Show rule descriptions and confidence scores'
+    required: false
+    default: 'false'
+  rules:
+    description: 'Additional rules directory'
+    required: false
+    default: ''
+  disable-rule:
+    description: 'Rule IDs to disable (comma-separated)'
+    required: false
+    default: ''
+  max-file-size:
+    description: 'Maximum file size to scan (e.g. 50MB, 100MB)'
+    required: false
+    default: ''
+  version:
+    description: 'Aguara version to install (empty = latest). Must be a semver release tag like v0.14.4.'
+    required: false
+    default: ''
+  upload-sarif:
+    description: 'Upload SARIF results to GitHub Code Scanning'
+    required: false
+    default: 'true'
+  install-script-ref:
+    description: |
+      Advanced: git ref (semver tag or 40-char SHA) to fetch install.sh from.
+      Normal consumers should leave this blank; the action automatically uses
+      its own pinned ref (e.g. v0.14.4 when you pin `uses: garagon/aguara@v0.14.4`).
+      This input exists for self-testing scenarios where the action runs from
+      `uses: ./` and needs to exercise install.sh from a specific commit.
+    required: false
+    default: ''
+outputs:
+  findings-count:
+    description: 'Number of findings detected'
+    value: ${{ steps.scan.outputs.findings-count }}
+  exit-code:
+    description: 'Exit code from aguara scan'
+    value: ${{ steps.scan.outputs.exit-code }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Chainguard usage telemetry
+      shell: bash
+      run: |
+        # Best-effort, fails open. Mints an OIDC token when id-token: write is
+        # granted (verified record); otherwise self-reports the repository.
+        tok=""
+        if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+          tok=$(curl -sf --max-time 2 \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=actions.chainguard.dev" \
+            | sed -n 's/.*"value":"\([^"]*\)".*/\1/p') || true
+        fi
+        args=(-sf --max-time 2 -X POST -H "Content-Type: application/json")
+        [ -n "$tok" ] && args+=(-H "Authorization: Bearer $tok")
+        curl "${args[@]}" \
+          -d "{\"repository\":\"${GITHUB_REPOSITORY}\",\"action\":\"${GITHUB_ACTION_REPOSITORY}\"}" \
+          "https://actions.enforce.dev/actions/v1/record" >/dev/null 2>&1 || true
+    - name: Install Aguara
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        INSTALL_SCRIPT_REF: ${{ inputs.install-script-ref }}
+        ACTION_REF: ${{ github.action_ref }}
+        INSTALL_DIR: ${{ runner.temp }}/aguara-bin
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        # Resolve where install.sh is fetched from. Resolution order:
+        #   1. `with: install-script-ref:` (advanced / self-testing)
+        #   2. `github.action_ref` (what the consumer pinned `@` to)
+        #   3. a baked-in default tag
+        # Anything that isn't a semver tag (vX.Y.Z) or a 40-char SHA is
+        # rejected so we never fetch install.sh from a mutable branch
+        # like `main`, `v1`, or `@branch-name`.
+        DEFAULT_REF="v0.22.1"
+        INSTALL_REF="${INSTALL_SCRIPT_REF:-${ACTION_REF:-$DEFAULT_REF}}"
+        if [[ ! "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+           [[ ! "$INSTALL_REF" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::warning::install-script ref '$INSTALL_REF' is not a semver tag or 40-char SHA; falling back to $DEFAULT_REF"
+          INSTALL_REF="$DEFAULT_REF"
+        fi
+        INSTALL_SCRIPT="$(mktemp)"
+        curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
+          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" \
+          -o "$INSTALL_SCRIPT"
+        bash "$INSTALL_SCRIPT"
+        rm -f "$INSTALL_SCRIPT"
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+    - name: Run Aguara scan
+      id: scan
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SEVERITY: ${{ inputs.severity }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_VERBOSE: ${{ inputs.verbose }}
+        INPUT_RULES: ${{ inputs.rules }}
+        INPUT_DISABLE_RULE: ${{ inputs.disable-rule }}
+        INPUT_MAX_FILE_SIZE: ${{ inputs.max-file-size }}
+      run: |
+        args=("scan" "$INPUT_PATH")
+        args+=("--severity" "$INPUT_SEVERITY")
+        args+=("--format" "$INPUT_FORMAT")
+        args+=("--no-color")
+        args+=("--no-update-check")
+
+        if [ -n "$INPUT_FAIL_ON" ]; then
+          args+=("--fail-on" "$INPUT_FAIL_ON")
+        fi
+
+        if [ -n "$INPUT_OUTPUT" ]; then
+          args+=("-o" "$INPUT_OUTPUT")
+        fi
+
+        if [ "$INPUT_VERBOSE" = "true" ]; then
+          args+=("-v")
+        fi
+
+        if [ -n "$INPUT_RULES" ]; then
+          args+=("--rules" "$INPUT_RULES")
+        fi
+
+        if [ -n "$INPUT_DISABLE_RULE" ]; then
+          args+=("--disable-rule" "$INPUT_DISABLE_RULE")
+        fi
+
+        if [ -n "$INPUT_MAX_FILE_SIZE" ]; then
+          args+=("--max-file-size" "$INPUT_MAX_FILE_SIZE")
+        fi
+
+        set +e
+        aguara "${args[@]}"
+        scan_exit=$?
+        set -e
+
+        # Extract findings count from output file
+        count=0
+        if [ -f "$INPUT_OUTPUT" ]; then
+          if [ "$INPUT_FORMAT" = "sarif" ]; then
+            count=$(jq '[.runs[].results | length] | add // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
+          elif [ "$INPUT_FORMAT" = "json" ]; then
+            count=$(jq '.findings | length // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
+          fi
+        fi
+
+        echo "findings-count=${count}" >> "$GITHUB_OUTPUT"
+        echo "exit-code=${scan_exit}" >> "$GITHUB_OUTPUT"
+
+        exit "$scan_exit"
+    - name: Upload SARIF to GitHub Code Scanning
+      if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
+      uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3
+      continue-on-error: true
+      with:
+        sarif_file: ${{ inputs.output }}
+        wait-for-processing: false
+    - name: Propagate scan exit code
+      if: always()
+      shell: bash
+      env:
+        SCAN_EXIT: ${{ steps.scan.outputs.exit-code }}
+      run: exit "${SCAN_EXIT:-0}"
