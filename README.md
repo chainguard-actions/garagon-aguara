@@ -13,6 +13,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | v0.22.2 | [`v0.22.2`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.22.2) | [`abed1a7`](https://github.com/garagon/aguara/commit/abed1a782b4b1d72f972a5d6e0fd9439c9c4f238) |
 | v0.23.0 | [`v0.23.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.23.0) | [`be225f0`](https://github.com/garagon/aguara/commit/be225f05ccb7c64f06d5f157114c39559e21859f) |
 | v0.24.0 | [`v0.24.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.24.0) | [`45caeaa`](https://github.com/garagon/aguara/commit/45caeaa3423b3a9c4fe3399daa70a2dae245f490) |
+| v0.27.0 | [`v0.27.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.27.0) | [`2ad546a`](https://github.com/garagon/aguara/commit/2ad546a95a03eb81f5255471c500ca326ee5220b) |
 
 ## Privacy
 
