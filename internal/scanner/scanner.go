@@ -1,0 +1,350 @@
+package scanner
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/garagon/aguara/internal/meta"
+)
+
+// CrossFileAccumulator can accumulate per-file data and finalize cross-file findings.
+type CrossFileAccumulator interface {
+	Accumulate(relPath string, content string)
+	Finalize() []Finding
+}
+
+// StateSaver can persist state after a scan completes.
+type StateSaver interface {
+	Save() error
+}
+
+// Scanner orchestrates the scanning process.
+type Scanner struct {
+	analyzers            []Analyzer
+	workers              int
+	minSeverity          Severity
+	ignorePatterns       []string
+	maxFileSize          int64
+	onProgress           func(current, total int)
+	toolName             string
+	scanProfile          ScanProfile
+	toolScopedRules      map[string]ToolScopedRule
+	disabledRules        map[string]bool
+	deduplicateMode      DeduplicateMode
+	crossFileAccumulator CrossFileAccumulator
+	stateStore           StateSaver
+}
+
+// New creates a new Scanner with the given number of workers.
+// If workers <= 0, it defaults to runtime.NumCPU().
+func New(workers int) *Scanner {
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	return &Scanner{
+		workers: workers,
+	}
+}
+
+// RegisterAnalyzer adds an analyzer to the scanner pipeline.
+func (s *Scanner) RegisterAnalyzer(a Analyzer) {
+	s.analyzers = append(s.analyzers, a)
+}
+
+// SetMinSeverity sets the minimum severity for reported findings.
+func (s *Scanner) SetMinSeverity(sev Severity) {
+	s.minSeverity = sev
+}
+
+// SetIgnorePatterns sets additional file ignore patterns from config.
+func (s *Scanner) SetIgnorePatterns(patterns []string) {
+	s.ignorePatterns = patterns
+}
+
+// SetMaxFileSize sets the maximum file size for scanning.
+// Zero means use the default (50 MB).
+func (s *Scanner) SetMaxFileSize(size int64) {
+	s.maxFileSize = size
+}
+
+// SetProgressFunc sets an optional callback invoked after each file is scanned.
+// The callback receives the number of files processed so far and the total count.
+// It may be called from multiple goroutines concurrently.
+func (s *Scanner) SetProgressFunc(fn func(current, total int)) {
+	s.onProgress = fn
+}
+
+// SetToolName sets the tool context for tool-aware false-positive reduction.
+func (s *Scanner) SetToolName(name string) {
+	s.toolName = name
+}
+
+// SetScanProfile sets the enforcement profile.
+func (s *Scanner) SetScanProfile(profile ScanProfile) {
+	s.scanProfile = profile
+}
+
+// SetToolScopedRules sets per-rule tool filtering from user configuration.
+func (s *Scanner) SetToolScopedRules(rules map[string]ToolScopedRule) {
+	s.toolScopedRules = rules
+}
+
+// SetDisabledRules suppresses findings whose RuleID is present in ids. This
+// covers both pattern rules (which already get filtered out of the compiled
+// rule list upstream) and analyzer-emitted IDs that the compiled-list filter
+// never sees: ci-trust (GHA_*), toxicflow (TOXIC_*), rugpull (RUGPULL_001),
+// NLP injection, and any cross-file finding. The filter runs in postProcess
+// before tool exemptions and dedup so disabled findings cost nothing
+// downstream.
+func (s *Scanner) SetDisabledRules(ids []string) {
+	if len(ids) == 0 {
+		s.disabledRules = nil
+		return
+	}
+	m := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			m[id] = true
+		}
+	}
+	if len(m) == 0 {
+		s.disabledRules = nil
+		return
+	}
+	s.disabledRules = m
+}
+
+// SetDeduplicateMode sets how findings on the same line are deduplicated.
+func (s *Scanner) SetDeduplicateMode(mode DeduplicateMode) {
+	s.deduplicateMode = mode
+}
+
+// SetCrossFileAccumulator sets the cross-file analyzer for directory scans.
+func (s *Scanner) SetCrossFileAccumulator(cfa CrossFileAccumulator) {
+	s.crossFileAccumulator = cfa
+}
+
+// SetStateStore sets a state saver to persist state after scan completes.
+func (s *Scanner) SetStateStore(store StateSaver) {
+	s.stateStore = store
+}
+
+// Scan performs a full scan of the given path. The path can be a directory
+// (walked recursively) or a single file.
+func (s *Scanner) Scan(ctx context.Context, root string) (*ScanResult, error) {
+	// Check if root is a single file (not a directory).
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		// Single-file scan: use the filename as RelPath so target-filtered
+		// rules (e.g. "*.md", "*.json") can match correctly.
+		targets := []*Target{{
+			Path:        root,
+			RelPath:     filepath.Base(root),
+			MaxFileSize: s.maxFileSize,
+		}}
+		return s.ScanTargets(ctx, targets)
+	}
+
+	// Directory scan: discover all files recursively.
+	discovery := &TargetDiscovery{IgnorePatterns: s.ignorePatterns, MaxFileSize: s.maxFileSize}
+	targets, err := discovery.Discover(root)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.ScanTargets(ctx, targets)
+}
+
+// ScanTargets runs the scanner pipeline on a pre-built list of targets.
+func (s *Scanner) ScanTargets(ctx context.Context, targets []*Target) (*ScanResult, error) {
+	start := time.Now()
+
+	// Fill MaxFileSize for targets that don't have it set.
+	if s.maxFileSize > 0 {
+		for _, t := range targets {
+			if t.MaxFileSize <= 0 {
+				t.MaxFileSize = s.maxFileSize
+			}
+		}
+	}
+
+	// Fan-out files to workers
+	fileCh := make(chan *Target, len(targets))
+	for _, t := range targets {
+		fileCh <- t
+	}
+	close(fileCh)
+
+	var (
+		mu        sync.Mutex
+		findings  []Finding
+		wg        sync.WaitGroup
+		processed atomic.Int32
+	)
+
+	total := len(targets)
+	for range s.workers {
+		wg.Go(func() {
+			for target := range fileCh {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := target.LoadContent(); err != nil {
+					continue
+				}
+				// Accumulate content for cross-file analysis
+				if s.crossFileAccumulator != nil {
+					s.crossFileAccumulator.Accumulate(target.RelPath, target.StringContent())
+				}
+				ignoreIndex := buildIgnoreIndex(parseIgnoreDirectives(target.Content))
+				for _, analyzer := range s.analyzers {
+					if ctx.Err() != nil {
+						return
+					}
+					results, err := analyzer.Analyze(ctx, target)
+					if err != nil {
+						continue
+					}
+					if len(results) > 0 {
+						if ignoreIndex != nil {
+							var kept []Finding
+							for _, f := range results {
+								if !isIgnoredByInline(ignoreIndex, f.Line, f.RuleID) {
+									kept = append(kept, f)
+								}
+							}
+							results = kept
+						}
+						if len(results) > 0 {
+							mu.Lock()
+							findings = append(findings, results...)
+							mu.Unlock()
+						}
+					}
+				}
+				if s.onProgress != nil {
+					n := int(processed.Add(1))
+					s.onProgress(n, total)
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	// Cross-file analysis: finalize after all workers complete
+	if s.crossFileAccumulator != nil {
+		findings = append(findings, s.crossFileAccumulator.Finalize()...)
+	}
+
+	findings = s.postProcess(findings)
+
+	verdict := computeVerdict(findings)
+	if s.scanProfile != ProfileStrict && len(findings) > 0 {
+		verdict = applyProfile(s.scanProfile, findings)
+	}
+
+	// Persist state (rug-pull hashes) if configured
+	if s.stateStore != nil {
+		_ = s.stateStore.Save() // best-effort; scan results are still valid
+	}
+
+	riskScore := meta.ComputeRiskScore(findings)
+
+	// Normalize the empty-result shape so the JSON output reads
+	// `"findings": []` instead of `"findings": null` on a clean scan.
+	// postProcess returns nil on several happy paths (no input, all
+	// filtered out by --disable-rule, all dropped by min-severity);
+	// downstream JSON consumers expect the array shape regardless.
+	if findings == nil {
+		findings = []Finding{}
+	}
+
+	return &ScanResult{
+		Findings:     findings,
+		FilesScanned: len(targets),
+		Verdict:      verdict,
+		RiskScore:    riskScore,
+		ToolName:     s.toolName,
+		Duration:     time.Since(start),
+	}, nil
+}
+
+// postProcess deduplicates, scores, correlates, filters, and sorts findings.
+func (s *Scanner) postProcess(findings []Finding) []Finding {
+	if len(findings) == 0 {
+		return nil
+	}
+
+	// Disabled-rule filter runs first: it is the cheapest definitive drop
+	// (user explicitly silenced these IDs) and ensures analyzer-emitted IDs
+	// (GHA_*, TOXIC_*, RUGPULL_001, etc.) receive the same suppression the
+	// compiled rule list already gives pattern rules.
+	if len(s.disabledRules) > 0 {
+		kept := findings[:0]
+		for _, f := range findings {
+			if !s.disabledRules[f.RuleID] {
+				kept = append(kept, f)
+			}
+		}
+		findings = kept
+		if len(findings) == 0 {
+			return nil
+		}
+	}
+
+	// Apply tool exemptions before dedup/scoring (removes definite false positives)
+	if s.toolName != "" {
+		findings = applyToolExemptions(s.toolName, findings, s.toolScopedRules)
+	}
+	findings = meta.DeduplicateWithMode(findings, s.deduplicateMode)
+	findings = meta.ScoreFindings(findings)
+	groups := meta.Correlate(findings)
+	findings = flattenGroups(groups)
+	findings = meta.AdjustConfidence(findings)
+
+	if s.minSeverity > SeverityInfo {
+		var filtered []Finding
+		for _, f := range findings {
+			if f.Severity >= s.minSeverity {
+				filtered = append(filtered, f)
+			}
+		}
+		findings = filtered
+	}
+
+	sort.Slice(findings, func(i, j int) bool {
+		if findings[i].Severity != findings[j].Severity {
+			return findings[i].Severity > findings[j].Severity
+		}
+		if findings[i].FilePath != findings[j].FilePath {
+			return findings[i].FilePath < findings[j].FilePath
+		}
+		return findings[i].Line < findings[j].Line
+	})
+
+	return findings
+}
+
+func flattenGroups(groups []meta.CorrelationGroup) []Finding {
+	var result []Finding
+	for _, g := range groups {
+		result = append(result, g.Findings...)
+	}
+	return result
+}

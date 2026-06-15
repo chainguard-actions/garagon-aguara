@@ -1,6 +1,11 @@
 {
   "owner": "garagon",
   "repo": "aguara",
-  "version": "",
-  "url": "https://github.com/garagon/aguara"
+  "version": "v0.22.2",
+  "commit_sha": "abed1a782b4b1d72f972a5d6e0fd9439c9c4f238",
+  "url": "https://github.com/garagon/aguara",
+  "policy_sha": "d636be7e43ef829af6e853da6b3c7566db9f72fe",
+  "test_policy_sha": "843adf9e4b8f85d0c08b27b9d0b09dd094b54702",
+  "test_agent_version": "1",
+  "harden_agent_version": "1"
 }
