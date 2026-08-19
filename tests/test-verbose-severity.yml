@@ -1,0 +1,65 @@
+name: Test verbose mode and severity filtering
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl
+        run: |
+          mkdir -p /tmp/fake-bin
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-curl-verbose.sh" /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: high
+          verbose: 'true'
+          format: sarif
+          output: aguara-results.sarif
+          upload-sarif: 'false'
+
+      - name: Assert outputs are correct
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "findings-count: $FINDINGS"
+          echo "exit-code: $EXIT_CODE"
+          if [ "$FINDINGS" != "0" ]; then
+            echo "FAIL: expected findings-count=0, got '$FINDINGS'"
+            exit 1
+          fi
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "FAIL: expected exit-code=0, got '$EXIT_CODE'"
+            exit 1
+          fi
+          echo "PASS: outputs correct"
+
+      - name: Assert verbose and severity flags were passed to aguara
+        run: |
+          if [ ! -f /tmp/aguara-args.txt ]; then
+            echo "FAIL: aguara was not called (args file missing)"
+            exit 1
+          fi
+          ARGS=$(cat /tmp/aguara-args.txt)
+          echo "aguara args: $ARGS"
+          if ! echo "$ARGS" | grep -q -- '--severity'; then
+            echo "FAIL: --severity flag not passed to aguara"
+            exit 1
+          fi
+          if ! echo "$ARGS" | grep -q -- 'high'; then
+            echo "FAIL: severity value 'high' not passed to aguara"
+            exit 1
+          fi
+          if ! echo "$ARGS" | grep -q -- '-v'; then
+            echo "FAIL: verbose flag -v not passed to aguara"
+            exit 1
+          fi
+          echo "PASS: correct flags passed to aguara"

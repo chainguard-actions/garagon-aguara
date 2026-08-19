@@ -1,19 +1,325 @@
-# garagon/aguara
+<p align="center">
+  <h1 align="center">Aguara</h1>
+  <p align="center">
+    Security scanner for AI agent skills and MCP servers.
+    <br />
+    Detect prompt injection, data exfiltration, and supply-chain attacks before they reach production.
+  </p>
+</p>
 
-Scan AI agent skills and MCP servers for security threats — prompt injection, data exfiltration, tool shadowing, and more.
+<p align="center">
+  <a href="https://github.com/garagon/aguara/actions/workflows/ci.yml"><img src="https://github.com/garagon/aguara/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://goreportcard.com/report/github.com/garagon/aguara"><img src="https://goreportcard.com/badge/github.com/garagon/aguara" alt="Go Report Card"></a>
+  <a href="https://pkg.go.dev/github.com/garagon/aguara"><img src="https://pkg.go.dev/badge/github.com/garagon/aguara.svg" alt="Go Reference"></a>
+  <a href="https://github.com/garagon/aguara/releases"><img src="https://img.shields.io/github/v/release/garagon/aguara" alt="GitHub Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/garagon/aguara" alt="License"></a>
+</p>
 
-Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at [https://github.com/garagon/aguara](https://github.com/garagon/aguara).
+<p align="center">
+  <a href="#installation">Installation</a> &bull;
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#usage">Usage</a> &bull;
+  <a href="#rules">Rules</a> &bull;
+  <a href="#aguara-mcp">Aguara MCP</a> &bull;
+  <a href="#aguara-watch">Aguara Watch</a> &bull;
+  <a href="#contributing">Contributing</a>
+</p>
 
-## Versions
+https://github.com/user-attachments/assets/851333be-048f-48fa-aaf3-f8cc1d4aa594
 
-| Version | Tag | Upstream commit |
-|---------|-----|-----------------|
-| v0.22.0 | [`v0.22.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.22.0) | [`e2f5f1a`](https://github.com/garagon/aguara/commit/e2f5f1ae826d8ceba1330eeba16f42f4aa481519) |
-| v0.22.1 | [`v0.22.1`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.22.1) | [`d56c754`](https://github.com/garagon/aguara/commit/d56c754cc17febd6c2ce5f63ed337e0f0476c90c) |
-| v0.22.2 | [`v0.22.2`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.22.2) | [`abed1a7`](https://github.com/garagon/aguara/commit/abed1a782b4b1d72f972a5d6e0fd9439c9c4f238) |
-| v0.23.0 | [`v0.23.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.23.0) | [`be225f0`](https://github.com/garagon/aguara/commit/be225f05ccb7c64f06d5f157114c39559e21859f) |
-| v0.24.0 | [`v0.24.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.24.0) | [`45caeaa`](https://github.com/garagon/aguara/commit/45caeaa3423b3a9c4fe3399daa70a2dae245f490) |
-| v0.27.0 | [`v0.27.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.27.0) | [`2ad546a`](https://github.com/garagon/aguara/commit/2ad546a95a03eb81f5255471c500ca326ee5220b) |
+## Why Aguara?
+
+AI agents and MCP servers run code on your behalf. A single malicious skill file can exfiltrate credentials, inject prompts, or install backdoors. Aguara catches these threats **before deployment** with static analysis that requires no API keys, no cloud, and no LLM.
+
+- **173+ rules across 13 categories** covering prompt injection, data exfiltration, credential leaks, supply-chain attacks, MCP-specific threats, and more.
+- **Confidence scoring** — every finding carries a confidence level (0.0–1.0), so you can prioritize triage and filter noise.
+- **Catches obfuscated attacks** that regex-only tools miss, using NLP-based markdown structure analysis and taint tracking.
+- **Deterministic** — same input, same output. Every scan is reproducible.
+- **CI-ready** — JSON, SARIF, and Markdown output. `--fail-on` threshold. `--changed` for incremental scans.
+- **Extensible** — write custom rules in YAML. No code required.
+
+## Installation
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/garagon/aguara/main/install.sh | bash
+```
+
+Installs the latest binary to `~/.local/bin`. Customize with environment variables:
+
+```bash
+VERSION=v0.5.0 curl -fsSL https://raw.githubusercontent.com/garagon/aguara/main/install.sh | bash
+INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/garagon/aguara/main/install.sh | bash
+```
+
+### Alternative methods
+
+**From source** (requires Go 1.25+):
+
+```bash
+go install github.com/garagon/aguara/cmd/aguara@latest
+```
+
+Pre-built binaries for Linux, macOS, and Windows are also available on the [Releases page](https://github.com/garagon/aguara/releases).
+
+## Quick Start
+
+```bash
+# Auto-discover and scan all MCP configs on your machine
+aguara scan --auto
+
+# Discover which MCP clients are configured (no scanning)
+aguara discover
+
+# Scan a skills directory
+aguara scan .claude/skills/
+
+# Scan a single file
+aguara scan .claude/skills/deploy/SKILL.md
+
+# Only high and critical findings
+aguara scan . --severity high
+
+# CI mode (exit 1 on high+, no color)
+aguara scan .claude/skills/ --ci
+```
+
+## Usage
+
+```
+aguara scan [path] [flags]
+
+Flags:
+      --auto                  Auto-discover and scan all MCP client configs
+      --severity string       Minimum severity to report: critical, high, medium, low, info (default "info")
+      --format string         Output format: terminal, json, sarif, markdown (default "terminal")
+  -o, --output string         Output file path (default: stdout)
+      --workers int           Number of worker goroutines (default: NumCPU)
+      --rules string          Additional rules directory
+      --disable-rule strings  Rule IDs to disable (comma-separated, repeatable)
+      --max-file-size string  Maximum file size to scan (e.g. 50MB, 100MB; default 50MB, range 1MB–500MB)
+      --no-color              Disable colored output
+      --no-update-check       Disable automatic update check (also: AGUARA_NO_UPDATE_CHECK=1)
+      --fail-on string        Exit code 1 if findings at or above this severity
+      --ci                    CI mode: --fail-on high --no-color
+      --changed               Only scan git-changed files
+  -v, --verbose               Show rule descriptions and confidence scores
+  -h, --help                  Help
+```
+
+### MCP Client Discovery
+
+Aguara can auto-detect MCP configurations across **17 clients**: Claude Desktop, Cursor, VS Code, Cline, Windsurf, OpenClaw, OpenCode, Zed, Amp, Gemini CLI, Copilot CLI, Amazon Q, Claude Code, Roo Code, Kilo Code, BoltAI, and JetBrains.
+
+```bash
+# List all detected MCP configs
+aguara discover
+
+# JSON output
+aguara discover --format json
+
+# Discover + scan in one command
+aguara scan --auto
+```
+
+### CI Integration
+
+#### GitHub Action
+
+```yaml
+- uses: garagon/aguara@v1
+```
+
+Scans your repository, uploads findings to GitHub Code Scanning, and optionally fails the build:
+
+```yaml
+- uses: garagon/aguara@v1
+  with:
+    path: ./mcp-server/
+    severity: medium
+    fail-on: high
+```
+
+All inputs are optional. See [`action.yml`](action.yml) for the full list.
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `path` | `./` | Path to scan |
+| `severity` | `info` | Minimum severity to report |
+| `fail-on` | _(none)_ | Fail if findings at or above this severity |
+| `format` | `sarif` | Output format: sarif, json, terminal, markdown |
+| `upload-sarif` | `true` | Upload SARIF to GitHub Code Scanning |
+| `version` | _(latest)_ | Pin a specific Aguara version |
+
+> **Note**: SARIF upload requires the `security-events: write` permission and is free for public repositories.
+
+#### Manual / GitLab CI
+
+```yaml
+# GitHub Actions (without the action)
+- name: Scan skills for security issues
+  run: |
+    curl -fsSL https://raw.githubusercontent.com/garagon/aguara/main/install.sh | bash
+    aguara scan .claude/skills/ --ci
+```
+
+```yaml
+# GitLab CI
+security-scan:
+  script:
+    - curl -fsSL https://raw.githubusercontent.com/garagon/aguara/main/install.sh | bash
+    - aguara scan .claude/skills/ --format sarif -o gl-sast-report.sarif --fail-on high
+  artifacts:
+    reports:
+      sast: gl-sast-report.sarif
+```
+
+### Configuration
+
+Create `.aguara.yml` in your project root:
+
+```yaml
+severity: medium
+fail_on: high
+max_file_size: 104857600  # 100 MB (default: 50 MB, range: 1 MB–500 MB)
+ignore:
+  - "vendor/**"
+  - "node_modules/**"
+rule_overrides:
+  CRED_004:
+    severity: low
+  EXTDL_004:
+    disabled: true
+```
+
+## Rules
+
+173+ built-in rules across 13 categories:
+
+| Category | Rules | What it detects |
+|----------|-------|-----------------|
+| Credential Leak | 20 | API keys (OpenAI, AWS, GCP, Stripe, ...), private keys, DB strings, HMAC secrets |
+| Prompt Injection | 18 + NLP | Instruction overrides, role switching, delimiter injection, jailbreaks, event injection |
+| Supply Chain | 18 | Download-and-execute, reverse shells, sandbox escape, symlink attacks, privilege escalation |
+| External Download | 17 | Binary downloads, curl-pipe-shell, auto-installs, profile persistence |
+| MCP Attack | 16 | Tool injection, name shadowing, canonicalization bypass, capability escalation |
+| Data Exfiltration | 16 + NLP | Webhook exfil, DNS tunneling, sensitive file reads, env var leaks |
+| Command Execution | 16 | shell=True, eval, subprocess, child_process, PowerShell |
+| MCP Config | 11 | Unpinned npx servers, hardcoded secrets, Docker cap-add, host networking |
+| SSRF & Cloud | 11 | Cloud metadata, IMDS, Docker socket, internal IPs, redirect following |
+| Indirect Injection | 10 | Fetch-and-follow, remote config, DB-driven instructions, webhook registration |
+| Third-Party Content | 10 | eval with external data, unsafe deserialization, missing SRI, HTTP downgrade |
+| Unicode Attack | 10 | RTL override, bidi, homoglyphs, zero-width sequences, normalization bypass |
+| Toxic Flow | 3 | User input to dangerous sinks, env vars to shell, API to eval |
+
+See [RULES.md](RULES.md) for the complete rule catalog with IDs and severity levels.
+
+### Custom Rules
+
+```yaml
+id: CUSTOM_001
+name: "Internal API endpoint"
+description: "Detects references to internal APIs"
+severity: HIGH
+category: custom
+targets: ["*.md", "*.txt"]
+match_mode: any
+patterns:
+  - type: regex
+    value: "https?://internal\\.mycompany\\.com"
+  - type: contains
+    value: "api.internal"
+exclude_patterns:            # optional: suppress match in these contexts
+  - type: contains
+    value: "## documentation"
+examples:
+  true_positive:
+    - "Fetch data from https://internal.mycompany.com/api/users"
+  false_positive:
+    - "Our public API is at https://api.mycompany.com"
+```
+
+`exclude_patterns` suppress a match when the matched line (or up to 3 lines before it) matches any exclude pattern. Useful for reducing false positives in documentation headings, installation guides, etc.
+
+```bash
+aguara scan .claude/skills/ --rules ./my-rules/
+```
+
+## Aguara MCP
+
+[Aguara MCP](https://github.com/garagon/aguara-mcp) is an MCP server that gives AI agents the ability to scan skills and configurations for security threats — before installing or running them. It imports Aguara as a Go library — one `go install`, no external binary needed.
+
+```bash
+# Install and register with Claude Code
+go install github.com/garagon/aguara-mcp@latest
+claude mcp add aguara -- aguara-mcp
+```
+
+Your agent gets 4 tools: `scan_content`, `check_mcp_config`, `list_rules`, and `explain_rule`. No network, no LLM, millisecond scans — the agent checks first, then decides.
+
+## Aguara Watch
+
+[Aguara Watch](https://watch.aguarascan.com/) continuously scans **28,000+ AI agent skills** across 5 public registries to track the real-world threat landscape for AI agents. All scans are powered by Aguara.
+
+## Go Library
+
+Aguara exposes a public Go API for embedding the scanner in other tools. [Aguara MCP](https://github.com/garagon/aguara-mcp) uses this API.
+
+```go
+import "github.com/garagon/aguara"
+
+// Scan a directory
+result, err := aguara.Scan(ctx, "./skills/")
+
+// Scan inline content (no disk I/O)
+result, err := aguara.ScanContent(ctx, content, "skill.md")
+
+// Discover all MCP client configs on the machine
+discovered, err := aguara.Discover()
+for _, client := range discovered.Clients {
+    fmt.Printf("%s: %d servers\n", client.Client, len(client.Servers))
+}
+
+// List rules, optionally filtered
+rules := aguara.ListRules(aguara.WithCategory("prompt-injection"))
+
+// Get rule details
+detail, err := aguara.ExplainRule("PROMPT_INJECTION_001")
+```
+
+Options: `WithMinSeverity()`, `WithDisabledRules()`, `WithCustomRules()`, `WithRuleOverrides()`, `WithWorkers()`, `WithIgnorePatterns()`, `WithMaxFileSize()`.
+
+## Architecture
+
+```
+aguara.go              Public API: Scan, ScanContent, Discover, ListRules, ExplainRule
+options.go             Functional options for the public API
+discover/              MCP client discovery: 17 clients, config parsers, auto-detection
+cmd/aguara/            CLI entry point (Cobra)
+internal/
+  engine/
+    pattern/           Layer 1: regex/contains matcher + base64/hex decoder + code block awareness
+    nlp/               Layer 2: goldmark AST walker, keyword classifier, injection detector
+    rugpull/           Rug-pull detection analyzer
+    toxicflow/         Taint tracking: source -> sink flow analysis
+  rules/               Rule engine: YAML loader, compiler, self-tester
+    builtin/           173 embedded rules across 12 YAML files (go:embed)
+  scanner/             Orchestrator: file discovery, parallel analysis, result aggregation
+  meta/                Post-processing: dedup, scoring, correlation, confidence adjustment
+  output/              Formatters: terminal (ANSI), JSON, SARIF, Markdown
+  config/              .aguara.yml loader
+  state/               Persistence for incremental scanning
+  types/               Shared types (Finding, Severity, ScanResult)
+```
+
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, adding rules, and the PR process.
+
+For security vulnerabilities, see [SECURITY.md](SECURITY.md).
+
+## License
+
+[Apache License 2.0](LICENSE)
 
 ## Privacy
 

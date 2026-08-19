@@ -1,0 +1,82 @@
+name: Test Action
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "action.yml"
+      - ".github/workflows/test-action.yml"
+
+permissions:
+  security-events: write
+
+jobs:
+  test-action:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run Aguara action (default — SARIF)
+        id: scan
+        uses: ./
+        with:
+          path: ./internal/rules/builtin/
+          severity: medium
+
+      - name: Verify outputs
+        shell: bash
+        env:
+          FINDINGS: ${{ steps.scan.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
+        run: |
+          echo "Findings: $FINDINGS"
+          echo "Exit code: $EXIT_CODE"
+          if [ -z "$FINDINGS" ]; then
+            echo "::error::findings-count output is empty"
+            exit 1
+          fi
+
+      - name: Verify SARIF file exists
+        run: |
+          if [ ! -f aguara-results.sarif ]; then
+            echo "::error::SARIF file not created"
+            exit 1
+          fi
+          jq '.runs[0].tool.driver.name' aguara-results.sarif
+
+  test-action-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run Aguara action (JSON, no SARIF upload)
+        id: scan
+        uses: ./
+        with:
+          path: ./internal/rules/builtin/
+          format: json
+          output: results.json
+          upload-sarif: 'false'
+
+      - name: Verify JSON output
+        run: |
+          if [ ! -f results.json ]; then
+            echo "::error::JSON file not created"
+            exit 1
+          fi
+          jq '.summary' results.json
+
+  test-action-fail-on:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run Aguara action (fail-on critical)
+        uses: ./
+        with:
+          path: ./internal/rules/builtin/
+          fail-on: critical
+          upload-sarif: 'false'

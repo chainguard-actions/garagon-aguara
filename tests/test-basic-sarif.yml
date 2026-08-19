@@ -1,0 +1,51 @@
+name: Test basic SARIF scan
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl
+        run: |
+          mkdir -p /tmp/fake-bin
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-curl-sarif.sh" /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: info
+          format: sarif
+          output: aguara-results.sarif
+          upload-sarif: 'false'
+
+      - name: Assert findings-count output
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "findings-count: $FINDINGS"
+          echo "exit-code: $EXIT_CODE"
+          if [ "$FINDINGS" != "0" ]; then
+            echo "FAIL: expected findings-count=0, got '$FINDINGS'"
+            exit 1
+          fi
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "FAIL: expected exit-code=0, got '$EXIT_CODE'"
+            exit 1
+          fi
+          echo "PASS"
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-results.sarif" ]; then
+            echo "FAIL: expected aguara-results.sarif to exist"
+            exit 1
+          fi
+          echo "PASS: SARIF file exists"
+          cat aguara-results.sarif
