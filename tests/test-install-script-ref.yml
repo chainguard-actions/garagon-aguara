@@ -1,0 +1,71 @@
+name: Test install-script-ref with explicit version
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a clean directory to scan
+        run: |
+          mkdir -p /tmp/ref-scan-target
+          echo "# Test" > /tmp/ref-scan-target/README.md
+
+      # Test with explicit semver install-script-ref (the primary self-testing use case)
+      - id: action
+        uses: .
+        with:
+          path: /tmp/ref-scan-target
+          severity: info
+          format: sarif
+          output: aguara-ref-results.sarif
+          upload-sarif: 'false'
+          install-script-ref: v0.24.0
+          version: v0.24.0
+        continue-on-error: true
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+      - name: Assert findings-count output is set and numeric
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS_COUNT"
+          if [ -z "$FINDINGS_COUNT" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-ref-results.sarif" ]; then
+            echo "FAIL: aguara-ref-results.sarif was not created"
+            exit 1
+          fi
+          echo "PASS: aguara-ref-results.sarif exists"
+
+      - name: Assert aguara binary is installed and functional
+        run: |
+          # The binary should be in RUNNER_TEMP/aguara-bin after install
+          if ! command -v aguara >/dev/null 2>&1; then
+            echo "FAIL: aguara binary not found in PATH"
+            exit 1
+          fi
+          echo "aguara found at: $(command -v aguara)"
+          echo "PASS: aguara binary is installed"

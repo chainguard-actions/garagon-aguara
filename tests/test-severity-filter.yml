@@ -1,0 +1,85 @@
+name: Test severity filtering
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a clean directory to scan
+        run: |
+          mkdir -p /tmp/severity-scan-target
+          echo "# Test" > /tmp/severity-scan-target/README.md
+
+      # Scan with high severity threshold — should only report high/critical findings
+      - id: action-high
+        uses: .
+        with:
+          path: /tmp/severity-scan-target
+          severity: high
+          format: sarif
+          output: aguara-high.sarif
+          upload-sarif: 'false'
+          install-script-ref: v0.24.0
+        continue-on-error: true
+
+      - name: Assert high-severity scan exit-code is set
+        env:
+          EXIT_CODE: ${{ steps.action-high.outputs.exit-code }}
+        run: |
+          echo "exit-code (high severity): $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+      - name: Assert high-severity findings-count is set and numeric
+        env:
+          FINDINGS_COUNT: ${{ steps.action-high.outputs.findings-count }}
+        run: |
+          echo "findings-count (high severity): $FINDINGS_COUNT"
+          if [ -z "$FINDINGS_COUNT" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert SARIF file exists for high severity scan
+        run: |
+          if [ ! -f "aguara-high.sarif" ]; then
+            echo "FAIL: aguara-high.sarif was not created"
+            exit 1
+          fi
+          echo "PASS: aguara-high.sarif exists"
+
+      # Scan same target with info severity — should report same or more findings
+      - id: action-info
+        uses: .
+        with:
+          path: /tmp/severity-scan-target
+          severity: info
+          format: sarif
+          output: aguara-info.sarif
+          upload-sarif: 'false'
+          install-script-ref: v0.24.0
+        continue-on-error: true
+
+      - name: Assert info-severity findings >= high-severity findings
+        env:
+          HIGH_COUNT: ${{ steps.action-high.outputs.findings-count }}
+          INFO_COUNT: ${{ steps.action-info.outputs.findings-count }}
+        run: |
+          echo "findings-count (high): $HIGH_COUNT"
+          echo "findings-count (info): $INFO_COUNT"
+          if [ "$INFO_COUNT" -lt "$HIGH_COUNT" ]; then
+            echo "FAIL: info severity scan ($INFO_COUNT) should have >= findings than high severity scan ($HIGH_COUNT)"
+            exit 1
+          fi
+          echo "PASS: info severity scan has >= findings than high severity scan"

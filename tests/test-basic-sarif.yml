@@ -1,0 +1,75 @@
+name: Test basic SARIF scan
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: info
+          format: sarif
+          output: aguara-results.sarif
+          upload-sarif: 'false'
+          install-script-ref: v0.24.0
+        continue-on-error: true
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is set to '$EXIT_CODE'"
+
+      - name: Assert findings-count output is set
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS_COUNT"
+          if [ -z "$FINDINGS_COUNT" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          # findings-count must be a non-negative integer
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-results.sarif" ]; then
+            echo "FAIL: aguara-results.sarif was not created"
+            exit 1
+          fi
+          echo "PASS: aguara-results.sarif exists"
+
+      - name: Assert SARIF file is valid JSON
+        run: |
+          if ! jq empty aguara-results.sarif 2>/dev/null; then
+            echo "FAIL: aguara-results.sarif is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: aguara-results.sarif is valid JSON"
+
+      - name: Assert SARIF has expected structure
+        run: |
+          version=$(jq -r '.version' aguara-results.sarif 2>/dev/null || echo "")
+          echo "SARIF version: $version"
+          runs=$(jq '.runs | length' aguara-results.sarif 2>/dev/null || echo "0")
+          echo "SARIF runs: $runs"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "FAIL: SARIF file missing version field"
+            exit 1
+          fi
+          echo "PASS: SARIF structure looks valid"

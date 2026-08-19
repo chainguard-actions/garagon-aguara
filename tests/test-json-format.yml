@@ -1,0 +1,75 @@
+name: Test JSON output format
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: info
+          format: json
+          output: aguara-results.json
+          upload-sarif: 'false'
+          install-script-ref: v0.24.0
+        continue-on-error: true
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+      - name: Assert findings-count output is set and numeric
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS_COUNT"
+          if [ -z "$FINDINGS_COUNT" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert JSON output file exists
+        run: |
+          if [ ! -f "aguara-results.json" ]; then
+            echo "FAIL: aguara-results.json was not created"
+            exit 1
+          fi
+          echo "PASS: aguara-results.json exists"
+
+      - name: Assert JSON file is valid JSON
+        run: |
+          if ! jq empty aguara-results.json 2>/dev/null; then
+            echo "FAIL: aguara-results.json is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: aguara-results.json is valid JSON"
+
+      - name: Assert findings-count matches JSON findings array
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+        run: |
+          json_count=$(jq '.findings | length // 0' aguara-results.json 2>/dev/null || echo 0)
+          echo "findings-count output: $FINDINGS_COUNT"
+          echo "JSON findings array length: $json_count"
+          if [ "$FINDINGS_COUNT" != "$json_count" ]; then
+            echo "FAIL: findings-count ($FINDINGS_COUNT) does not match JSON findings array length ($json_count)"
+            exit 1
+          fi
+          echo "PASS: findings-count matches JSON output"

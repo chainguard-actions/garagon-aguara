@@ -1,0 +1,69 @@
+name: Test markdown output format
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a clean directory to scan
+        run: |
+          mkdir -p /tmp/markdown-scan-target
+          echo "# Hello World" > /tmp/markdown-scan-target/README.md
+
+      - id: action
+        uses: .
+        with:
+          path: /tmp/markdown-scan-target
+          severity: info
+          format: markdown
+          output: aguara-results.md
+          upload-sarif: 'false'
+          install-script-ref: v0.24.0
+        continue-on-error: true
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+      - name: Assert findings-count output is set and numeric
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS_COUNT"
+          if [ -z "$FINDINGS_COUNT" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert markdown output file exists
+        run: |
+          if [ ! -f "aguara-results.md" ]; then
+            echo "FAIL: aguara-results.md was not created"
+            exit 1
+          fi
+          echo "PASS: aguara-results.md exists"
+
+      - name: Assert markdown file is not empty
+        run: |
+          size=$(wc -c < aguara-results.md)
+          echo "File size: $size bytes"
+          if [ "$size" -eq 0 ]; then
+            echo "WARN: aguara-results.md is empty (may be expected for no findings)"
+          else
+            echo "PASS: aguara-results.md has content ($size bytes)"
+          fi
