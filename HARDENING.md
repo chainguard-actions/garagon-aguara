@@ -8,35 +8,83 @@
 
 **Test Policy SHA:** `843adf9e4b8f85d0c08b27b9d0b09dd094b54702`
 
-**Harden Agent Version:** `1`
+**Harden Agent Version:** `2`
 
-Action **garagon--aguara/v0.22.0** was hardened automatically. 2 finding(s) were identified and resolved across 1 iteration(s).
+Action **garagon--aguara/v0.22.0** was hardened automatically. 4 finding(s) were identified and resolved across 3 iteration(s).
 
 ## Findings Fixed
 
 ### unsafe-shell (severity: high)
 
-The 'Install Aguara' step downloads install.sh from a remote URL and pipes it directly to bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Remote content is executed without first saving to a file and verifying its integrity. An attacker who can influence the fetched content (e.g., via a compromised CDN or MITM) could execute arbitrary code on the runner.
+action.yml fetches install.sh from a remote URL and pipes it directly to bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. This executes remotely-fetched content without first saving it to a file for inspection, which is an unsafe shell pattern.
 
 Locations:
 
-- `action.yml:92`
+- `action.yml:79`
+
+### script-injection (severity: high)
+
+release.yml interpolates `${{ github.ref_name }}` directly inside two `run:` shell command strings (sub-rule a). (1) `git tag -fa v1 -m "v1 action alias -> ${{ github.ref_name }}"` and (2) `gh api ... -f "client_payload[tag]=${{ github.ref_name }}"`. Any ${{ ... }} expression inside a run: block is a script-injection risk because YAML template substitution occurs before the shell parses the string.
+
+Locations:
+
+- `.github/workflows/release.yml:50`
+- `.github/workflows/release.yml:58`
 
 ### unpinned-uses (severity: high)
 
-The step `uses: github/codeql-action/upload-sarif@v3` references a mutable tag (`@v3`) rather than a pinned 40-character commit SHA. A mutable tag can be moved to point to a different (potentially malicious) commit, creating a supply-chain risk.
+Multiple workflow files and action.yml reference actions using mutable version tags instead of immutable 40-character commit SHAs. Failing references: action.yml: github/codeql-action/upload-sarif@v3; ci.yml: actions/checkout@v4, actions/setup-go@v6; docker.yml: actions/checkout@v4, docker/setup-qemu-action@v3, docker/setup-buildx-action@v3, docker/login-action@v3, docker/metadata-action@v5, docker/build-push-action@v7; intel-publish.yml: actions/checkout@v4, actions/setup-go@v6; release.yml: actions/checkout@v4, actions/setup-go@v6; test-action.yml: actions/checkout@v4 (x3).
 
 Locations:
 
-- `action.yml:136`
+- `action.yml:131`
+- `.github/workflows/ci.yml:14`
+- `.github/workflows/ci.yml:16`
+- `.github/workflows/docker.yml:21`
+- `.github/workflows/docker.yml:25`
+- `.github/workflows/docker.yml:28`
+- `.github/workflows/docker.yml:31`
+- `.github/workflows/docker.yml:44`
+- `.github/workflows/docker.yml:48`
+- `.github/workflows/intel-publish.yml:38`
+- `.github/workflows/intel-publish.yml:42`
+- `.github/workflows/release.yml:18`
+- `.github/workflows/release.yml:22`
+- `.github/workflows/test-action.yml:20`
+- `.github/workflows/test-action.yml:55`
+- `.github/workflows/test-action.yml:76`
+
+### missing-permissions (severity: medium)
+
+ci.yml has no top-level `permissions:` key and the single job `test` also has no job-level `permissions:` key. Without explicit permissions, the workflow inherits the repository default token permissions, which may be overly broad.
+
+Locations:
+
+- `.github/workflows/ci.yml:1`
 
 ## Iteration Notes
 
 ### Iteration 1
 
-**Fixes applied:** unsafe-shell, unpinned-uses
+**Fixes applied:** unsafe-shell, script-injection, unpinned-uses, missing-permissions
 
 **Notes:**
 
-1. unsafe-shell (line 92): Replaced `curl ... | bash` with a two-step approach: download install.sh to a mktemp file first using `-o "$install_script"`, then execute it with `bash "$install_script"`, and clean up afterward. This prevents arbitrary code execution from a compromised CDN or MITM attack. 2. unpinned-uses (line 136): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3` to prevent supply-chain attacks via mutable tag references.
+Fixed all four findings: (1) unsafe-shell in action.yml: replaced `curl | bash` with download-to-tempfile then execute pattern; (2) script-injection in release.yml: moved both `${{ github.ref_name }}` expressions into env: blocks as REF_NAME; (3) unpinned-uses: pinned all 16 mutable tag references across action.yml, ci.yml, docker.yml, intel-publish.yml, release.yml, and test-action.yml to full 40-char commit SHAs using lookup_action_sha; (4) missing-permissions in ci.yml: added top-level `permissions: contents: read` block.
+
+### Iteration 2
+
+**Fixes applied:** script-injection
+
+**Notes:**
+
+Fixed the script injection vulnerability in the 'Sign image' step of hardened/action/.github/workflows/docker.yml. Replaced the unquoted `for tag in $TAGS` (which allowed word splitting and glob expansion on the workflow-controllable `steps.meta.outputs.tags` value) with `readarray -t tags <<< "$TAGS"` to safely read the multi-line value into a bash array, then iterate with `for tag in "${tags[@]}"` to keep each tag properly quoted.
+
+### Iteration 3
+
+**Fixes applied:** github-env-injection
+
+**Notes:**
+
+Fixed the github-env-injection finding in the 'Install Aguara' step of action.yml. Replaced the direct `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` with a sanitized version that first strips newline characters: `safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')` followed by `echo "$safe_install_dir" >> "$GITHUB_PATH"`. This prevents a malformed runner.temp value containing newlines from injecting arbitrary entries into $GITHUB_PATH.
 

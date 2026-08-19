@@ -1,0 +1,39 @@
+name: Test markdown output format
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          format: markdown
+          output: aguara-results.md
+          severity: info
+          upload-sarif: 'false'
+          install-script-ref: v0.22.0
+        continue-on-error: true
+
+      - name: Assert markdown output file exists
+        run: |
+          if [ ! -f "aguara-results.md" ]; then
+            echo "FAIL: Markdown output file not found"
+            exit 1
+          fi
+          echo "PASS: Markdown output file exists"
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if ! echo "$EXIT_CODE" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: exit-code is not a number: '$EXIT_CODE'"
+            exit 1
+          fi
+          echo "PASS: exit-code=$EXIT_CODE"

@@ -1,0 +1,60 @@
+name: Test disable-rule input
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Run scan with some rules disabled — action should still complete successfully
+      - id: action
+        uses: .
+        with:
+          path: ./
+          format: sarif
+          output: aguara-disabled.sarif
+          severity: info
+          disable-rule: 'PI001,PI002'
+          upload-sarif: 'false'
+          install-script-ref: v0.22.0
+        continue-on-error: true
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-disabled.sarif" ]; then
+            echo "FAIL: SARIF output file not found"
+            exit 1
+          fi
+          echo "PASS: SARIF output file exists"
+
+      - name: Assert SARIF file is valid JSON
+        run: |
+          if ! jq empty aguara-disabled.sarif 2>/dev/null; then
+            echo "FAIL: SARIF output is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: SARIF file is valid JSON"
+
+      - name: Assert findings-count output is a number
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS"
+          if ! echo "$FINDINGS" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count is not a non-negative integer: '$FINDINGS'"
+            exit 1
+          fi
+          echo "PASS: findings-count=$FINDINGS"
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if ! echo "$EXIT_CODE" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: exit-code is not a number: '$EXIT_CODE'"
+            exit 1
+          fi
+          echo "PASS: exit-code=$EXIT_CODE"

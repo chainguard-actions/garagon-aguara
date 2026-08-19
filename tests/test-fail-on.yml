@@ -1,0 +1,61 @@
+name: Test fail-on threshold
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Scan with fail-on=critical — on a clean repo this should exit 0
+      # We use continue-on-error so the workflow doesn't fail if there are findings
+      - id: action
+        uses: .
+        with:
+          path: ./
+          format: sarif
+          output: aguara-failon.sarif
+          severity: info
+          fail-on: critical
+          upload-sarif: 'false'
+          install-script-ref: v0.22.0
+        continue-on-error: true
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-failon.sarif" ]; then
+            echo "FAIL: SARIF output file not found"
+            exit 1
+          fi
+          echo "PASS: SARIF output file exists"
+
+      - name: Assert SARIF file is valid JSON
+        run: |
+          if ! jq empty aguara-failon.sarif 2>/dev/null; then
+            echo "FAIL: SARIF output is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: SARIF file is valid JSON"
+
+      - name: Assert exit-code output is set and is a number
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if ! echo "$EXIT_CODE" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: exit-code is not a number: '$EXIT_CODE'"
+            exit 1
+          fi
+          echo "PASS: exit-code=$EXIT_CODE"
+
+      - name: Assert findings-count output is a number
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS"
+          if ! echo "$FINDINGS" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count is not a non-negative integer: '$FINDINGS'"
+            exit 1
+          fi
+          echo "PASS: findings-count=$FINDINGS"
