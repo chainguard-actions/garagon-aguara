@@ -1,0 +1,61 @@
+name: Test custom output file path and disable-rule
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl and fake install.sh
+        run: |
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-install.sh" /tmp/fake-install.sh
+          chmod +x /tmp/fake-install.sh
+
+          mkdir -p /tmp/fake-bin
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-curl.sh" /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          format: sarif
+          output: custom-scan-output.sarif
+          disable-rule: 'AGUARA-001,AGUARA-002'
+          upload-sarif: 'false'
+          install-script-ref: v0.23.0
+
+      - name: Assert custom output file exists
+        run: |
+          if [ ! -f "custom-scan-output.sarif" ]; then
+            echo "FAIL: expected custom-scan-output.sarif to exist"
+            exit 1
+          fi
+          echo "PASS: custom output file exists"
+          cat custom-scan-output.sarif
+
+      - name: Assert exit-code is 0
+        env:
+          ACTUAL: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "actual exit-code: $ACTUAL"
+          if [ "$ACTUAL" != "0" ]; then
+            echo "FAIL: expected exit-code=0, got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS"
+
+      - name: Assert findings-count is 0
+        env:
+          ACTUAL: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "actual findings-count: $ACTUAL"
+          if [ "$ACTUAL" != "0" ]; then
+            echo "FAIL: expected findings-count=0, got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS"

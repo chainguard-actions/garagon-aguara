@@ -1,0 +1,65 @@
+name: Test fail-on with findings present
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl and fake install.sh (with findings)
+        run: |
+          # Use the findings variant so aguara reports a finding and exits 1 when fail-on is set
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-install-with-findings.sh" /tmp/fake-install.sh
+          chmod +x /tmp/fake-install.sh
+
+          mkdir -p /tmp/fake-bin
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-curl.sh" /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          format: sarif
+          output: aguara-results.sarif
+          fail-on: high
+          upload-sarif: 'false'
+          install-script-ref: v0.23.0
+        # The action exits 1 when findings are at or above fail-on threshold.
+        # continue-on-error lets us assert on the outputs afterward.
+        continue-on-error: true
+
+      - name: Assert exit-code output is non-zero (findings triggered fail-on)
+        env:
+          ACTUAL: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "actual exit-code: $ACTUAL"
+          if [ "$ACTUAL" = "0" ]; then
+            echo "FAIL: expected non-zero exit-code when fail-on is triggered, got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS: exit-code is non-zero as expected"
+
+      - name: Assert findings-count output is non-zero
+        env:
+          ACTUAL: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "actual findings-count: $ACTUAL"
+          if [ "$ACTUAL" = "0" ] || [ -z "$ACTUAL" ]; then
+            echo "FAIL: expected findings-count > 0, got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS: findings-count=$ACTUAL"
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-results.sarif" ]; then
+            echo "FAIL: expected aguara-results.sarif to exist even when findings are present"
+            exit 1
+          fi
+          echo "PASS: SARIF file exists"
+          cat aguara-results.sarif

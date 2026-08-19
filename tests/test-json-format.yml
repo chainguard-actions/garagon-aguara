@@ -1,0 +1,65 @@
+name: Test JSON output format
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl and fake install.sh
+        run: |
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-install.sh" /tmp/fake-install.sh
+          chmod +x /tmp/fake-install.sh
+
+          mkdir -p /tmp/fake-bin
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-curl.sh" /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          format: json
+          output: aguara-results.json
+          upload-sarif: 'false'
+          install-script-ref: v0.23.0
+
+      - name: Assert findings-count output is 0
+        env:
+          ACTUAL: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "actual findings-count: $ACTUAL"
+          if [ "$ACTUAL" != "0" ]; then
+            echo "FAIL: expected findings-count=0, got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS"
+
+      - name: Assert exit-code output is 0
+        env:
+          ACTUAL: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "actual exit-code: $ACTUAL"
+          if [ "$ACTUAL" != "0" ]; then
+            echo "FAIL: expected exit-code=0, got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS"
+
+      - name: Assert JSON output file exists and is valid
+        run: |
+          if [ ! -f "aguara-results.json" ]; then
+            echo "FAIL: expected aguara-results.json to exist"
+            exit 1
+          fi
+          echo "PASS: JSON file exists"
+          cat aguara-results.json
+          if ! jq . aguara-results.json > /dev/null 2>&1; then
+            echo "FAIL: output is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: valid JSON"

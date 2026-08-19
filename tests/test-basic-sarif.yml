@@ -1,0 +1,56 @@
+name: Test basic SARIF scan
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: info
+          format: sarif
+          output: aguara-results.sarif
+          upload-sarif: 'false'
+          install-script-ref: v0.23.0
+        continue-on-error: true
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+      - name: Assert findings-count output is set
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS"
+          if [ -z "$FINDINGS" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS'"
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-results.sarif" ]; then
+            echo "FAIL: aguara-results.sarif was not created"
+            exit 1
+          fi
+          echo "PASS: SARIF output file exists"
+
+      - name: Assert SARIF file is valid JSON
+        run: |
+          if ! jq empty aguara-results.sarif 2>/dev/null; then
+            echo "FAIL: aguara-results.sarif is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: SARIF file is valid JSON"

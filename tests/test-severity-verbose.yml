@@ -1,0 +1,52 @@
+name: Test severity filter and verbose mode
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl and fake install.sh
+        run: |
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-install.sh" /tmp/fake-install.sh
+          chmod +x /tmp/fake-install.sh
+
+          mkdir -p /tmp/fake-bin
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-curl.sh" /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: high
+          verbose: 'true'
+          format: sarif
+          output: aguara-results.sarif
+          upload-sarif: 'false'
+          install-script-ref: v0.23.0
+
+      - name: Assert action completed successfully
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          echo "findings-count: $FINDINGS"
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "FAIL: expected exit-code=0, got '$EXIT_CODE'"
+            exit 1
+          fi
+          echo "PASS: action completed with exit-code=0"
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-results.sarif" ]; then
+            echo "FAIL: expected aguara-results.sarif to exist"
+            exit 1
+          fi
+          echo "PASS: SARIF file exists"
