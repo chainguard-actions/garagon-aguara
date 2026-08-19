@@ -1,0 +1,93 @@
+name: Test fail-on behavior with findings detected
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl to intercept install.sh download (with findings binary)
+        run: |
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-install-with-findings.sh" /tmp/fake-install-aguara.sh
+          chmod +x /tmp/fake-install-aguara.sh
+
+          mkdir -p /tmp/fake-bin
+          printf '%s\n' '#!/bin/sh' \
+            'out=""' \
+            'prev=""' \
+            'for arg in "$@"; do' \
+            '  case "$prev" in' \
+            '    -o|--output) out="$arg" ;;' \
+            '  esac' \
+            '  prev="$arg"' \
+            'done' \
+            'case "$*" in' \
+            '  *garagon/aguara*install.sh*)' \
+            '    if [ -n "$out" ]; then' \
+            '      cat /tmp/fake-install-aguara.sh > "$out"' \
+            '    else' \
+            '      cat /tmp/fake-install-aguara.sh' \
+            '    fi' \
+            '    exit 0' \
+            '    ;;' \
+            'esac' \
+            'exec /usr/bin/curl "$@"' \
+            > /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: info
+          format: sarif
+          output: aguara-results.sarif
+          fail-on: low
+          upload-sarif: 'false'
+          install-script-ref: v0.22.2
+        # The action exits 1 when fail-on is set and findings are found.
+        # We use continue-on-error so the workflow doesn't abort.
+        continue-on-error: true
+
+      - name: Assert exit-code is non-zero when findings exceed fail-on threshold
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ "$EXIT_CODE" = "0" ]; then
+            echo "FAIL: expected non-zero exit code when fail-on is set and findings exist"
+            exit 1
+          fi
+          echo "PASS: exit-code=$EXIT_CODE (non-zero as expected)"
+
+      - name: Assert findings-count is greater than zero
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS"
+          if ! echo "$FINDINGS" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count is not a number: '$FINDINGS'"
+            exit 1
+          fi
+          if [ "$FINDINGS" -le 0 ]; then
+            echo "FAIL: expected findings-count > 0, got $FINDINGS"
+            exit 1
+          fi
+          echo "PASS: findings-count=$FINDINGS (greater than zero)"
+
+      - name: Assert SARIF output file was created with findings
+        run: |
+          if [ ! -f "aguara-results.sarif" ]; then
+            echo "FAIL: aguara-results.sarif was not created"
+            exit 1
+          fi
+          count=$(jq '[.runs[].results | length] | add // 0' aguara-results.sarif 2>/dev/null || echo 0)
+          echo "SARIF results count: $count"
+          if [ "$count" -le 0 ]; then
+            echo "FAIL: expected findings in SARIF output, got $count"
+            exit 1
+          fi
+          echo "PASS: SARIF file has $count findings"

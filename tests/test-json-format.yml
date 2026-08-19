@@ -1,0 +1,85 @@
+name: Test JSON output format
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up fake curl to intercept install.sh download
+        run: |
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-install.sh" /tmp/fake-install-aguara.sh
+          chmod +x /tmp/fake-install-aguara.sh
+
+          mkdir -p /tmp/fake-bin
+          printf '%s\n' '#!/bin/sh' \
+            'out=""' \
+            'prev=""' \
+            'for arg in "$@"; do' \
+            '  case "$prev" in' \
+            '    -o|--output) out="$arg" ;;' \
+            '  esac' \
+            '  prev="$arg"' \
+            'done' \
+            'case "$*" in' \
+            '  *garagon/aguara*install.sh*)' \
+            '    if [ -n "$out" ]; then' \
+            '      cat /tmp/fake-install-aguara.sh > "$out"' \
+            '    else' \
+            '      cat /tmp/fake-install-aguara.sh' \
+            '    fi' \
+            '    exit 0' \
+            '    ;;' \
+            'esac' \
+            'exec /usr/bin/curl "$@"' \
+            > /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - id: action
+        uses: .
+        with:
+          path: ./
+          severity: info
+          format: json
+          output: aguara-results.json
+          upload-sarif: 'false'
+          install-script-ref: v0.22.2
+
+      - name: Assert findings-count output is numeric
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS"
+          if ! echo "$FINDINGS" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count is not a number: '$FINDINGS'"
+            exit 1
+          fi
+          echo "PASS: findings-count=$FINDINGS"
+
+      - name: Assert JSON output file was created
+        run: |
+          if [ ! -f "aguara-results.json" ]; then
+            echo "FAIL: aguara-results.json was not created"
+            exit 1
+          fi
+          echo "PASS: JSON output file exists"
+          cat aguara-results.json
+
+      - name: Assert JSON output file is valid JSON
+        run: |
+          if ! jq . aguara-results.json > /dev/null 2>&1; then
+            echo "FAIL: aguara-results.json is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: JSON output file is valid JSON"
+
+      - name: Assert findings array exists in JSON output
+        run: |
+          if ! jq -e '.findings' aguara-results.json > /dev/null 2>&1; then
+            echo "FAIL: .findings key not found in JSON output"
+            exit 1
+          fi
+          echo "PASS: .findings key present in JSON output"

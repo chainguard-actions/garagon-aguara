@@ -1,0 +1,100 @@
+name: Test Action
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "action.yml"
+      - ".github/workflows/test-action.yml"
+
+permissions:
+  security-events: write
+
+concurrency:
+  group: test-action-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-action:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run Aguara action (default — SARIF)
+        id: scan
+        uses: ./
+        with:
+          path: ./internal/rules/builtin/
+          severity: medium
+          # Exercise the PR's own install.sh, not the baked-in default.
+          # Without this override, the action falls back to DEFAULT_REF
+          # (latest release), which for the first PR that touches action.yml
+          # after a release may be ahead of or behind the install.sh the PR
+          # introduces.
+          install-script-ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify outputs
+        shell: bash
+        env:
+          FINDINGS: ${{ steps.scan.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
+        run: |
+          echo "Findings: $FINDINGS"
+          echo "Exit code: $EXIT_CODE"
+          if [ -z "$FINDINGS" ]; then
+            echo "::error::findings-count output is empty"
+            exit 1
+          fi
+
+      - name: Verify SARIF file exists
+        run: |
+          if [ ! -f aguara-results.sarif ]; then
+            echo "::error::SARIF file not created"
+            exit 1
+          fi
+          jq '.runs[0].tool.driver.name' aguara-results.sarif
+
+  test-action-json:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run Aguara action (JSON, no SARIF upload)
+        id: scan
+        uses: ./
+        with:
+          path: ./internal/rules/builtin/
+          format: json
+          output: results.json
+          upload-sarif: 'false'
+          # Exercise the PR's own install.sh, not the baked-in default.
+          install-script-ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify JSON output
+        run: |
+          if [ ! -f results.json ]; then
+            echo "::error::JSON file not created"
+            exit 1
+          fi
+          jq '.summary' results.json
+
+  test-action-fail-on:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run Aguara action (fail-on critical, clean fixture, expect exit 0)
+        uses: ./
+        with:
+          path: ./.github/test-fixtures/clean/
+          fail-on: critical
+          upload-sarif: 'false'
+          # Exercise the PR's own install.sh, not the baked-in default.
+          install-script-ref: ${{ github.event.pull_request.head.sha || github.sha }}
