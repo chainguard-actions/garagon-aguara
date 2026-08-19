@@ -1,0 +1,60 @@
+name: Test JSON output format
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          path: ./
+          severity: info
+          format: json
+          output: aguara-results.json
+          upload-sarif: 'false'
+          install-script-ref: v0.22.1
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+      - name: Assert findings-count output is set
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS_COUNT"
+          if [ -z "$FINDINGS_COUNT" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert JSON output file was created
+        run: |
+          if [ ! -f "aguara-results.json" ]; then
+            echo "FAIL: aguara-results.json was not created"
+            exit 1
+          fi
+          echo "PASS: aguara-results.json exists"
+          # Validate it is valid JSON
+          if ! jq '.' aguara-results.json > /dev/null 2>&1; then
+            echo "FAIL: aguara-results.json is not valid JSON"
+            exit 1
+          fi
+          echo "PASS: aguara-results.json is valid JSON"

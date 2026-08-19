@@ -1,0 +1,67 @@
+name: Test fail-on input
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Create a clean directory with no security issues to scan
+      - name: Create clean scan target
+        run: |
+          mkdir -p /tmp/clean-target
+          cat > /tmp/clean-target/hello.py << 'EOF'
+          def greet(name):
+              return f"Hello, {name}!"
+
+          if __name__ == "__main__":
+              print(greet("world"))
+          EOF
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          path: /tmp/clean-target
+          severity: info
+          fail-on: critical
+          format: sarif
+          output: aguara-failon.sarif
+          upload-sarif: 'false'
+          install-script-ref: v0.22.1
+
+      - name: Assert exit-code output is set
+        env:
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "exit-code: $EXIT_CODE"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output was not set"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+      - name: Assert findings-count output is set
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "findings-count: $FINDINGS_COUNT"
+          if [ -z "$FINDINGS_COUNT" ]; then
+            echo "FAIL: findings-count output was not set"
+            exit 1
+          fi
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert SARIF output file was created
+        run: |
+          if [ ! -f "aguara-failon.sarif" ]; then
+            echo "FAIL: aguara-failon.sarif was not created"
+            exit 1
+          fi
+          echo "PASS: aguara-failon.sarif exists"
