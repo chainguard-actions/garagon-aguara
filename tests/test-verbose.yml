@@ -1,0 +1,60 @@
+name: Test verbose mode
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          path: ./
+          format: sarif
+          output: aguara-verbose.sarif
+          severity: info
+          verbose: 'true'
+          upload-sarif: 'false'
+
+      - name: Assert action ran with verbose mode
+        env:
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "findings-count: $FINDINGS_COUNT"
+          echo "exit-code: $EXIT_CODE"
+
+          if [ "$OUTCOME" = "skipped" ]; then
+            echo "FAIL: action was skipped unexpectedly"
+            exit 1
+          fi
+
+          if [ -z "$EXIT_CODE" ]; then
+            echo "FAIL: exit-code output is empty"
+            exit 1
+          fi
+          echo "PASS: exit-code is '$EXIT_CODE'"
+
+          if ! echo "$FINDINGS_COUNT" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count '$FINDINGS_COUNT' is not a non-negative integer"
+            exit 1
+          fi
+          echo "PASS: findings-count is '$FINDINGS_COUNT'"
+
+      - name: Assert SARIF output file exists
+        run: |
+          if [ ! -f "aguara-verbose.sarif" ]; then
+            echo "FAIL: SARIF output file not found"
+            exit 1
+          fi
+          echo "PASS: SARIF output file exists"
+          jq -e '.runs' aguara-verbose.sarif > /dev/null 2>&1 || {
+            echo "FAIL: SARIF file does not contain a 'runs' key"
+            exit 1
+          }
+          echo "PASS: SARIF file is valid"
