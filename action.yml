@@ -110,11 +110,12 @@ runs:
         fi
         INSTALL_SCRIPT="$(mktemp)"
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
-          -o "$INSTALL_SCRIPT" \
-          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
+          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" \
+          -o "$INSTALL_SCRIPT"
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
-        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        safe=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
+        echo "$safe" >> "$GITHUB_PATH"
     - name: Run Aguara scan
       id: scan
       shell: bash
@@ -180,7 +181,7 @@ runs:
         exit "$scan_exit"
     - name: Upload SARIF to GitHub Code Scanning
       if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
-      uses: github/codeql-action/upload-sarif@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3
+      uses: chainguard-actions/github-codeql-action/upload-sarif@02c8b1fece55d94b9fc8de711efd251dad82618c # v3
       continue-on-error: true
       with:
         sarif_file: ${{ inputs.output }}
