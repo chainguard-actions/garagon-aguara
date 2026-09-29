@@ -114,8 +114,8 @@ runs:
           -o "$INSTALL_SCRIPT"
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
-        safe=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
-        echo "$safe" >> "$GITHUB_PATH"
+        safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
+        echo "$safe_install_dir" >> "$GITHUB_PATH"
     - name: Run Aguara scan
       id: scan
       shell: bash
