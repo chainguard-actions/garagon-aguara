@@ -16,19 +16,19 @@ Action **garagon--aguara/v0.23.0** was hardened automatically. 2 finding(s) were
 
 ### unsafe-shell (severity: high)
 
-In the 'Install Aguara' step, the install script is fetched from a remote URL and piped directly to bash without first downloading to a file: `curl -fsSL --max-time 30 --retry 3 --retry-connrefused "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. If the remote server or the URL is compromised, arbitrary code executes immediately in the runner. The script should be downloaded to a temporary file, its integrity verified (e.g. via checksum), and then executed separately.
+The 'Install Aguara' step fetches a remote shell script and pipes it directly to bash without first downloading and verifying it separately. The command `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash` executes remote content inline, which is an unsafe shell pattern. A compromised or man-in-the-middle response could execute arbitrary code on the runner.
 
 Locations:
 
-- `action.yml:98`
+- `action.yml:99`
 
 ### unpinned-uses (severity: high)
 
-The composite action step 'Upload SARIF to GitHub Code Scanning' references `github/codeql-action/upload-sarif@v3`, which uses a mutable version tag instead of a pinned 40-character commit SHA. A tag can be moved to point to a different (potentially malicious) commit at any time, enabling a supply-chain attack. It should be pinned to a full SHA, e.g. `github/codeql-action/upload-sarif@<40-char-sha> # v3`.
+The 'Upload SARIF to GitHub Code Scanning' step references `github/codeql-action/upload-sarif@v3`, which uses a mutable tag (`v3`) rather than a pinned 40-character commit SHA. A tag can be moved to point to a different (potentially malicious) commit, creating a supply-chain risk.
 
 Locations:
 
-- `action.yml:148`
+- `action.yml:143`
 
 ## Iteration Notes
 
@@ -38,5 +38,5 @@ Locations:
 
 **Notes:**
 
-1. unsafe-shell (line 98): Replaced `curl ... | bash` with a safe download-then-execute pattern: script is downloaded to a mktemp file, executed with `bash "$INSTALL_SCRIPT"`, then removed. 2. unpinned-uses (line 148): Pinned `github/codeql-action/upload-sarif@v3` to full SHA `1190a975f95ce23525efb6a3fc21ea29567c1b52` with `# v3` comment for readability.
+1. unsafe-shell (line 99): Replaced `curl ... | bash` with a safe pattern: download install.sh to a temp file via `mktemp`, execute it with `bash "$INSTALL_SCRIPT"`, then remove the temp file. This prevents remote content from being executed inline. 2. unpinned-uses (line 143): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `@1190a975f95ce23525efb6a3fc21ea29567c1b52` with a `# v3` comment for readability.
 
