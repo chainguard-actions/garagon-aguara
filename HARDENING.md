@@ -16,19 +16,19 @@ Action **garagon--aguara/v0.22.1** was hardened automatically. 2 finding(s) were
 
 ### unsafe-shell (severity: high)
 
-The 'Install Aguara' step fetches a remote shell script and pipes it directly to bash without first downloading and verifying it: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. This is the classic curl-pipe-bash anti-pattern; a compromised or MITM'd response would execute arbitrary code on the runner.
+The 'Install Aguara' step in action.yml pipes a remotely fetched script directly to bash without first saving it to a file: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. This is an unsafe shell pattern — remote content is executed immediately without inspection or integrity verification of the shell script itself (separate from the binary checksum verification done inside install.sh).
 
 Locations:
 
-- `action.yml:97`
+- `action.yml:99`
 
 ### unpinned-uses (severity: high)
 
-The step `uses: github/codeql-action/upload-sarif@v3` references a mutable tag (`v3`) rather than a pinned 40-character commit SHA. If the tag is moved (intentionally or via a supply-chain compromise), the action will silently execute different code. Pin to a full SHA, e.g. `uses: github/codeql-action/upload-sarif@<40-char-sha> # v3`.
+The 'Upload SARIF to GitHub Code Scanning' step uses `github/codeql-action/upload-sarif@v3`, which is a mutable tag reference rather than a pinned 40-character SHA commit hash. If the tag is moved (e.g. by a supply-chain compromise), the action would silently execute different code.
 
 Locations:
 
-- `action.yml:148`
+- `action.yml:150`
 
 ## Iteration Notes
 
@@ -38,7 +38,7 @@ Locations:
 
 **Notes:**
 
-1. unsafe-shell (line 97): Replaced `curl ... | bash` with a two-step approach: download install.sh to a temp file via `mktemp`, then execute it with `bash "$INSTALL_SCRIPT"`, then remove the temp file. This eliminates the curl-pipe-bash anti-pattern. 2. unpinned-uses (line 148): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `1190a975f95ce23525efb6a3fc21ea29567c1b52` with `# v3` comment for readability.
+1. unsafe-shell (line 99): Replaced `curl ... | bash` with a safe two-step pattern: download install.sh to a temp file using `mktemp` and curl's `-o` flag, then execute it with `bash "$INSTALL_SCRIPT"`, then remove the temp file. 2. unpinned-uses (line 150): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `github/codeql-action/upload-sarif@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3`.
 
 ### Iteration 2
 
@@ -46,5 +46,5 @@ Locations:
 
 **Notes:**
 
-Fixed the github-env-injection finding in the 'Install Aguara' step of action.yml. The direct `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` was replaced with a two-step approach: first sanitizing the value with `safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')`, then writing the sanitized value `echo "$safe_install_dir" >> "$GITHUB_PATH"`. This prevents newline injection into GITHUB_PATH from the runner.temp context value.
+Fixed the github-env-injection finding in the 'Install Aguara' step of action.yml (line 84). The INSTALL_DIR value (from runner.temp context) was being written directly to $GITHUB_PATH without sanitization. Added a sanitization step using `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'` to strip newline and carriage return characters before writing to $GITHUB_PATH, preventing potential environment file injection attacks.
 
