@@ -114,8 +114,7 @@ runs:
           -o "$INSTALL_SCRIPT"
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
-        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
-        echo "$safe_install_dir" >> "$GITHUB_PATH"
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
     - name: Run Aguara scan
       id: scan
       shell: bash
@@ -181,7 +180,7 @@ runs:
         exit "$scan_exit"
     - name: Upload SARIF to GitHub Code Scanning
       if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
-      uses: chainguard-actions/github-codeql-action/upload-sarif@98b43a37a8c2b4393abd9a20ee705a87f7a4bfa6 # v3
+      uses: chainguard-actions/github-codeql-action/upload-sarif@02c8b1fece55d94b9fc8de711efd251dad82618c # v3
       continue-on-error: true
       with:
         sarif_file: ${{ inputs.output }}
