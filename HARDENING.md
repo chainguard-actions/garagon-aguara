@@ -10,41 +10,44 @@
 
 **Harden Agent Version:** `2`
 
-Action **garagon--aguara/v0.23.0** was hardened automatically. 2 finding(s) were identified and resolved across 2 iteration(s).
+Action **garagon--aguara/v0.23.0** was hardened automatically. 3 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### unsafe-shell (severity: high)
 
-The 'Install Aguara' step in action.yml pipes a remotely fetched script directly to bash: `curl -fsSL --max-time 30 --retry 3 --retry-connrefused "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Even though the ref is validated against a semver/SHA pattern before use, the script content is never verified before execution. The script should be downloaded to a temporary file first, its integrity verified (e.g. via checksum), and then executed separately.
+The 'Install Aguara' step pipes a remotely fetched script directly to bash without first saving it to a file: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. This allows arbitrary remote code execution if the URL is compromised or the content is tampered with in transit.
 
 Locations:
 
-- `action.yml:97`
+- `action.yml:88`
 
 ### unpinned-uses (severity: high)
 
-The step 'Upload SARIF to GitHub Code Scanning' uses a mutable tag reference `github/codeql-action/upload-sarif@v3` instead of a pinned 40-character SHA commit hash. A mutable tag can be silently updated to point to different (potentially malicious) code. It should be pinned to a full SHA, e.g. `github/codeql-action/upload-sarif@<40-char-sha> # v3`.
+The step `uses: github/codeql-action/upload-sarif@v3` references a mutable tag (`@v3`) instead of a pinned 40-character commit SHA. If the tag is moved or the repository is compromised, the action could execute arbitrary code.
 
 Locations:
 
-- `action.yml:148`
+- `action.yml:131`
+
+### github-env-injection (severity: high)
+
+The 'Install Aguara' step writes `$INSTALL_DIR` to `$GITHUB_PATH` without sanitization: `echo "$INSTALL_DIR" >> "$GITHUB_PATH"`. `INSTALL_DIR` is set from the expression `${{ runner.temp }}/aguara-bin` in the env block. Per the check rules, `runner.*` expressions are untrusted inputs that flow through YAML template substitution before the shell sees them. Writing this value to a special environment file without the required sanitization step (`printf '%s' "$INSTALL_DIR" | tr -d '\n\r'`) is a violation.
+
+Locations:
+
+- `action.yml:89`
 
 ## Iteration Notes
 
 ### Iteration 1
 
-**Fixes applied:** unsafe-shell, unpinned-uses
+**Fixes applied:** unsafe-shell, unpinned-uses, github-env-injection
 
 **Notes:**
 
-1. unsafe-shell (line 97): Replaced `curl ... | bash` with a download-then-execute pattern: script is saved to a temp file via `mktemp`, then executed with `bash "$INSTALL_SCRIPT"`, then cleaned up with `rm -f`. No positional arguments were dropped since install.sh uses environment variables (VERSION, INSTALL_DIR, GITHUB_TOKEN) rather than positional args. 2. unpinned-uses (line 148): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `1190a975f95ce23525efb6a3fc21ea29567c1b52` with a `# v3` comment preserved for readability.
-
-### Iteration 2
-
-**Fixes applied:** github-env-injection
-
-**Notes:**
-
-Fixed the github-env-injection finding in the 'Install Aguara' step of action.yml. The INSTALL_DIR value (set from ${{ runner.temp }}/aguara-bin) was being written directly to $GITHUB_PATH without sanitization. Added a sanitization step: `safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"` and then used `echo "$safe_install_dir" >> "$GITHUB_PATH"` to write the sanitized value.
+Three fixes applied to hardened/action/action.yml:
+1. unsafe-shell (line 88): Replaced `curl ... | bash` with downloading the install script to a temp file via `mktemp`, then executing `bash "$INSTALL_SCRIPT"`, then removing the temp file.
+2. unpinned-uses (line 131): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `@9f759ee644a3e7c15c1390abf49868036c00067b # v3`.
+3. github-env-injection (line 89): Added sanitization of INSTALL_DIR before writing to $GITHUB_PATH using `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'` stored in `safe_install_dir`, which is then written to $GITHUB_PATH.
 
