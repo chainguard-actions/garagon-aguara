@@ -10,21 +10,21 @@
 
 **Harden Agent Version:** `2`
 
-Action **garagon--aguara/v0.22.1** was hardened automatically. 2 finding(s) were identified and resolved across 2 iteration(s).
+Action **garagon--aguara/v0.22.1** was hardened automatically. 2 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### unsafe-shell (severity: high)
 
-The 'Install Aguara' step downloads install.sh from a remote URL and pipes it directly to bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. The script is never saved to disk for inspection before execution. This is an unsafe shell pattern — if the remote URL is compromised or the ref is manipulated, arbitrary code executes on the runner.
+The 'Install Aguara' step fetches a remote shell script and pipes it directly to bash without first saving it to a file for inspection: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. If the remote URL is compromised or the ref is manipulated, arbitrary code executes on the runner with no opportunity to verify the script's integrity before execution.
 
 Locations:
 
-- `action.yml:96`
+- `action.yml:97`
 
 ### unpinned-uses (severity: high)
 
-The action references `github/codeql-action/upload-sarif@v3` using a mutable tag (`v3`) instead of a pinned 40-character commit SHA. If the tag is moved (intentionally or via a supply-chain compromise), the action will silently execute different code.
+The 'Upload SARIF to GitHub Code Scanning' step references `github/codeql-action/upload-sarif@v3`, which is a mutable tag. If the tag is moved to a different commit (e.g. via a supply-chain attack), the action will silently execute different code. It must be pinned to a full 40-character commit SHA (e.g. `github/codeql-action/upload-sarif@<sha> # v3`).
 
 Locations:
 
@@ -38,14 +38,6 @@ Locations:
 
 **Notes:**
 
-1. unsafe-shell (line 96): Replaced `curl ... | bash` with a safe two-step pattern: download install.sh to a temp file via `mktemp` and `curl -o`, then execute it with `bash "$INSTALL_SCRIPT"`, then remove the temp file. This prevents arbitrary code execution if the remote URL is compromised, and allows the script to be inspected before running.
-2. unpinned-uses (line 148): Pinned `github/codeql-action/upload-sarif@v3` to the full 40-character commit SHA `ce5e7eeac396d720fe2d802714996c8ce561e311`, keeping `# v3` as a comment for readability.
-
-### Iteration 2
-
-**Fixes applied:** github-env-injection
-
-**Notes:**
-
-Fixed the github-env-injection finding in the 'Install Aguara' step of action.yml. The INSTALL_DIR value (sourced from runner.temp context) is now sanitized with `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'` before being written to $GITHUB_PATH, preventing potential newline injection into the PATH environment file.
+1. unsafe-shell (line 97): Replaced `curl ... | bash` with a two-step approach: download install.sh to a temp file via `mktemp`, then execute it with `bash "$INSTALL_SCRIPT"`, then clean up with `rm -f`. This allows the script to be inspected before execution and eliminates the pipe-to-shell risk.
+2. unpinned-uses (line 148): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `ce5e7eeac396d720fe2d802714996c8ce561e311` with `# v3` comment for readability.
 
