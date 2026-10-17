@@ -1,9 +1,11 @@
 name: 'Aguara Security Scanner'
 description: 'Scan AI agent skills and MCP servers for security threats — prompt injection, data exfiltration, tool shadowing, and more.'
 author: 'garagon'
+
 branding:
   icon: 'shield'
   color: 'orange'
+
 inputs:
   path:
     description: 'Path to scan'
@@ -58,6 +60,7 @@ inputs:
       `uses: ./` and needs to exercise install.sh from a specific commit.
     required: false
     default: ''
+
 outputs:
   findings-count:
     description: 'Number of findings detected'
@@ -65,6 +68,7 @@ outputs:
   exit-code:
     description: 'Exit code from aguara scan'
     value: ${{ steps.scan.outputs.exit-code }}
+
 runs:
   using: 'composite'
   steps:
@@ -114,7 +118,9 @@ runs:
           -o "$INSTALL_SCRIPT"
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
-        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
+        echo "$safe_install_dir" >> "$GITHUB_PATH"
+
     - name: Run Aguara scan
       id: scan
       shell: bash
@@ -178,6 +184,7 @@ runs:
         echo "exit-code=${scan_exit}" >> "$GITHUB_OUTPUT"
 
         exit "$scan_exit"
+
     - name: Upload SARIF to GitHub Code Scanning
       if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
       uses: github/codeql-action/upload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
@@ -185,6 +192,7 @@ runs:
       with:
         sarif_file: ${{ inputs.output }}
         wait-for-processing: false
+
     - name: Propagate scan exit code
       if: always()
       shell: bash
