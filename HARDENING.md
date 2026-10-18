@@ -10,45 +10,33 @@
 
 **Harden Agent Version:** `2`
 
-Action **garagon--aguara/v0.24.0** was hardened automatically. 3 finding(s) were identified and resolved across 1 iteration(s).
+Action **garagon--aguara/v0.24.0** was hardened automatically. 2 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### unsafe-shell (severity: high)
 
-The 'Install Aguara' step in action.yml pipes a remotely-fetched script directly to bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. This executes remote content without first saving it to a file for inspection, allowing a compromised or MITM'd response to execute arbitrary code immediately.
+The 'Install Aguara' step downloads install.sh from a remote URL and pipes it directly to `bash` without first saving it to a file and verifying its integrity. Pattern: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Even though the ref is validated as a semver tag or 40-char SHA, the script content is executed immediately without a checksum or signature check, making this an unsafe-shell pattern.
 
 Locations:
 
-- `action.yml:98`
+- `action.yml:94`
 
 ### unpinned-uses (severity: high)
 
-The 'Upload SARIF to GitHub Code Scanning' step uses `github/codeql-action/upload-sarif@v3`, which is pinned to a mutable tag (`v3`) rather than a full 40-character commit SHA. A tag can be moved to point to a different (potentially malicious) commit without notice.
+The step 'Upload SARIF to GitHub Code Scanning' references `github/codeql-action/upload-sarif@v3`, which uses a mutable version tag (`@v3`) instead of a pinned 40-character commit SHA. A mutable tag can be silently updated to point to a different (potentially malicious) commit, creating a supply-chain risk.
 
 Locations:
 
-- `action.yml:138`
-
-### github-env-injection (severity: high)
-
-The 'Install Aguara' step sets `INSTALL_DIR: ${{ runner.temp }}/aguara-bin` in the env: block and then writes `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` without the required sanitization step (`printf '%s' "$INSTALL_DIR" | tr -d '\n\r'`). The `runner.temp` value flows through YAML template substitution before the shell processes it, and writing it unsanitized to $GITHUB_PATH allows newline injection that could add arbitrary entries to the PATH.
-
-Locations:
-
-- `action.yml:80`
-- `action.yml:99`
+- `action.yml:145`
 
 ## Iteration Notes
 
 ### Iteration 1
 
-**Fixes applied:** unsafe-shell, unpinned-uses, github-env-injection
+**Fixes applied:** unsafe-shell, unpinned-uses
 
 **Notes:**
 
-Fixed three security findings in hardened/action/action.yml:
-1. unsafe-shell (line 98): Replaced `curl ... | bash` pipe with download-to-tempfile-then-execute pattern. Script is saved via `-o "$INSTALL_SCRIPT"`, executed with `bash "$INSTALL_SCRIPT"`, then cleaned up with `rm -f`.
-2. unpinned-uses (line 138): Pinned `github/codeql-action/upload-sarif@v3` to full commit SHA `@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3`.
-3. github-env-injection (lines 80/99): Added sanitization of the `INSTALL_DIR` value before writing to `$GITHUB_PATH` using `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'` to strip newline characters that could inject additional PATH entries.
+1. unsafe-shell (line 94): Replaced `curl ... | bash` with a two-step approach: download install.sh to a temp file via `mktemp`, then execute it with `bash "$INSTALL_SCRIPT"`, then clean up with `rm -f`. No shell option arguments were present after `bash` in the original pipe form, so no `--` removal was needed. 2. unpinned-uses (line 145): Pinned `github/codeql-action/upload-sarif@v3` to the full commit SHA `ce5e7eeac396d720fe2d802714996c8ce561e311`, preserving the tag as a `# v3` comment for readability.
 
