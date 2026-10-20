@@ -10,45 +10,49 @@
 
 **Harden Agent Version:** `2`
 
-Action **garagon--aguara/v0.22.0** was hardened automatically. 3 finding(s) were identified and resolved across 1 iteration(s).
+Action **garagon--aguara/v0.22.0** was hardened automatically. 3 finding(s) were identified and resolved across 2 iteration(s).
 
 ## Findings Fixed
 
-### unsafe-shell (severity: high)
-
-The 'Install Aguara' step downloads install.sh and pipes it straight into bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Download the script to a file first, check its checksum, then run it as a separate command.
-
-Locations:
-
-- `action.yml:75`
-
 ### unpinned-uses (severity: high)
 
-A composite step references an action by a version tag instead of a full commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
+The composite step points to a version tag instead of a full commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
 
 Locations:
 
-- `action.yml:135`
+- `action.yml:169`
+
+### unsafe-shell (severity: high)
+
+The Install Aguara step downloads a remote script and pipes it straight into bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Download the script to a file, check it, then run it.
+
+Locations:
+
+- `action.yml:99`
 
 ### github-env-injection (severity: high)
 
-The 'Install Aguara' step runs `echo "$INSTALL_DIR" >> "$GITHUB_PATH"`. INSTALL_DIR is set in the step's env: block from ${{ runner.temp }}, so it is not a literal computed inside the run: script. The value is written without first running `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'`.
+The Install Aguara step writes `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` without first running the required `printf '%s' ... | tr -d '\n\r'` sanitization. INSTALL_DIR comes from the step's env: block (`${{ runner.temp }}/aguara-bin`), not from a literal computed in the same run: script.
 
 Locations:
 
-- `action.yml:77`
+- `action.yml:101`
 
 ## Iteration Notes
 
 ### Iteration 1
 
-**Fixes applied:** unsafe-shell, unpinned-uses, github-env-injection
+**Fixes applied:** unpinned-uses, unsafe-shell, github-env-injection
 
 **Notes:**
 
-All three findings are fixed in action.yml. I haven't run the action or its tests since changing it.
+Pinned github/codeql-action/upload-sarif to ce5e7eeac396d720fe2d802714996c8ce561e311 (v3). install.sh is now saved to a mktemp file with curl -o. The step then checks the file is not empty and starts with a shebang, runs it with bash and deletes it. The env vars install.sh needs are unchanged. INSTALL_DIR now has newlines stripped (printf | tr -d '\n\r') before it is written to GITHUB_PATH.
 
-- unsafe-shell: install.sh is now saved to a temp file before it runs, instead of going straight from curl into bash. If the download is empty the step stops, and it prints the file's sha256 hash in the log. It does not compare that hash to an expected value: the ref can be any release tag or commit, so there is no single known hash to check against. What limits the risk is the action's existing rule that the ref must be a vX.Y.Z tag or a 40-character commit SHA. After that the file runs with `bash "$file"` with no arguments, as before, and is then deleted.
-- github-env-injection: INSTALL_DIR has newlines and carriage returns stripped with `printf '%s' | tr -d '\n\r'` before it is written to $GITHUB_PATH.
-- unpinned-uses: github/codeql-action/upload-sarif@v3 is now pinned to commit ce5e7eeac396d720fe2d802714996c8ce561e311, with a `# v3` comment.
+### Iteration 2
+
+**Fixes applied:** unpinned-uses
+
+**Notes:**
+
+Pinned github/codeql-action/upload-sarif@v3 to ce5e7eeac396d720fe2d802714996c8ce561e311 (# v3) in action.yml.
 

@@ -116,11 +116,10 @@ runs:
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
           -o "$INSTALL_SCRIPT" \
           "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
-        if [ ! -s "$INSTALL_SCRIPT" ]; then
-          echo "::error::Downloaded install.sh is empty"
+        if [ ! -s "$INSTALL_SCRIPT" ] || ! head -n 1 "$INSTALL_SCRIPT" | grep -q '^#!'; then
+          echo "::error::Downloaded install.sh is empty or not a shell script"
           exit 1
         fi
-        echo "install.sh sha256: $(sha256sum "$INSTALL_SCRIPT" 2>/dev/null || shasum -a 256 "$INSTALL_SCRIPT")"
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
         safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
@@ -180,7 +179,7 @@ runs:
         if [ -f "$INPUT_OUTPUT" ]; then
           if [ "$INPUT_FORMAT" = "sarif" ]; then
             count=$(jq '[.runs[].results | length] | add // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
-          elif [ "$INPUT_FORMAT" = "json" ]; then
+          elif [ "$INPUTupload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3n" ]; then
             count=$(jq '.findings | length // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
           fi
         fi
