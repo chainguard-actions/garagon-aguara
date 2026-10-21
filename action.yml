@@ -116,8 +116,8 @@ runs:
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
           -o "$INSTALL_SCRIPT" \
           "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
-        if [ ! -s "$INSTALL_SCRIPT" ] || ! head -n 1 "$INSTALL_SCRIPT" | grep -q '^#!'; then
-          echo "::error::Downloaded install.sh is empty or not a shell script"
+        if [ ! -s "$INSTALL_SCRIPT" ]; then
+          echo "::error::Downloaded install.sh is empty"
           exit 1
         fi
         bash "$INSTALL_SCRIPT"
@@ -179,7 +179,7 @@ runs:
         if [ -f "$INPUT_OUTPUT" ]; then
           if [ "$INPUT_FORMAT" = "sarif" ]; then
             count=$(jq '[.runs[].results | length] | add // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
-          elif [ "$INPUTupload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3n" ]; then
+          elif [ "$INPUT_FORMAT" = "json" ]; then
             count=$(jq '.findings | length // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
           fi
         fi
@@ -191,7 +191,7 @@ runs:
 
     - name: Upload SARIF to GitHub Code Scanning
       if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
-      uses: github/codeql-action/upload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
+      uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
       continue-on-error: true
       with:
         sarif_file: ${{ inputs.output }}

@@ -10,49 +10,47 @@
 
 **Harden Agent Version:** `2`
 
-Action **garagon--aguara/v0.22.0** was hardened automatically. 3 finding(s) were identified and resolved across 2 iteration(s).
+Action **garagon--aguara/v0.22.0** was hardened automatically. 3 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
-### unpinned-uses (severity: high)
-
-The composite step points to a version tag instead of a full commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
-
-Locations:
-
-- `action.yml:169`
-
 ### unsafe-shell (severity: high)
 
-The Install Aguara step downloads a remote script and pipes it straight into bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Download the script to a file, check it, then run it.
+The Install Aguara step downloads a remote script and pipes it straight into bash: curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash. The script should be saved to a file first, checked, and then run.
 
 Locations:
 
-- `action.yml:99`
+- `action.yml:71`
+
+### unpinned-uses (severity: high)
+
+A composite step uses a mutable tag instead of a full 40-character commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
+
+Locations:
+
+- `action.yml:139`
 
 ### github-env-injection (severity: high)
 
-The Install Aguara step writes `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` without first running the required `printf '%s' ... | tr -d '\n\r'` sanitization. INSTALL_DIR comes from the step's env: block (`${{ runner.temp }}/aguara-bin`), not from a literal computed in the same run: script.
+The Install Aguara step writes INSTALL_DIR to GITHUB_PATH without sanitizing it first: echo "$INSTALL_DIR" >> "$GITHUB_PATH". INSTALL_DIR comes from the env block (${{ runner.temp }}/aguara-bin), not from a literal computed in the same script. The value should go through printf '%s' "$INSTALL_DIR" | tr -d '\n\r' right before the write.
 
 Locations:
 
-- `action.yml:101`
+- `action.yml:73`
 
 ## Iteration Notes
 
 ### Iteration 1
 
-**Fixes applied:** unpinned-uses, unsafe-shell, github-env-injection
+**Fixes applied:** unsafe-shell, unpinned-uses, github-env-injection
 
 **Notes:**
 
-Pinned github/codeql-action/upload-sarif to ce5e7eeac396d720fe2d802714996c8ce561e311 (v3). install.sh is now saved to a mktemp file with curl -o. The step then checks the file is not empty and starts with a shebang, runs it with bash and deletes it. The env vars install.sh needs are unchanged. INSTALL_DIR now has newlines stripped (printf | tr -d '\n\r') before it is written to GITHUB_PATH.
+All three findings are fixed in action.yml. Nothing was run or tested.
 
-### Iteration 2
+- **unsafe-shell:** install.sh is now saved to a temp file with curl -o. The step stops if the file is empty, otherwise runs it with `bash "$file"` and then deletes it. Upstream piped it into a plain `bash` without arguments, so there was no `--` to drop. The installer still gets VERSION, INSTALL_DIR and GITHUB_TOKEN from the env block as before.
+- **unpinned-uses:** github/codeql-action/upload-sarif@v3 is now pinned to `@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3`.
+- **github-env-injection:** INSTALL_DIR goes through `printf '%s' | tr -d '\n\r'` before it is written to $GITHUB_PATH.
 
-**Fixes applied:** unpinned-uses
-
-**Notes:**
-
-Pinned github/codeql-action/upload-sarif@v3 to ce5e7eeac396d720fe2d802714996c8ce561e311 (# v3) in action.yml.
+One possible problem I left alone: the step decides which install.sh to download from github.action_ref. If someone pins this hardened copy by its own commit SHA, that SHA passes the check but probably doesn't exist in garagon/aguara, so the download would fail. Pinning by a vX.Y.Z tag that matches an upstream release works, and so does setting install-script-ref.
 
