@@ -112,17 +112,18 @@ runs:
           echo "::warning::install-script ref '$INSTALL_REF' is not a semver tag or 40-char SHA; falling back to $DEFAULT_REF"
           INSTALL_REF="$DEFAULT_REF"
         fi
-        INSTALL_SCRIPT="$(mktemp)"
+        INSTALL_SCRIPT="$(mktemp "${RUNNER_TEMP:-/tmp}/aguara-install.XXXXXX.sh")"
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
-          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" -o "$INSTALL_SCRIPT"
+          -o "$INSTALL_SCRIPT" \
+          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
         if [ ! -s "$INSTALL_SCRIPT" ]; then
           echo "::error::Downloaded install.sh is empty"
           exit 1
         fi
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
-        safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
-        echo "$safe_install_dir" >> "$GITHUB_PATH"
+        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
+        printf '%s\n' "$safe_install_dir" >> "$GITHUB_PATH"
 
     - name: Run Aguara scan
       id: scan
@@ -190,7 +191,7 @@ runs:
 
     - name: Upload SARIF to GitHub Code Scanning
       if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
-      uses: github/codeql-action/upload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
+      uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
       continue-on-error: true
       with:
         sarif_file: ${{ inputs.output }}
