@@ -116,14 +116,15 @@ runs:
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
           -o "$INSTALL_SCRIPT" \
           "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
-        if [ ! -s "$INSTALL_SCRIPT" ]; then
-          echo "::error::Downloaded install.sh is empty"
+        if [ ! -s "$INSTALL_SCRIPT" ] || ! head -n 1 "$INSTALL_SCRIPT" | grep -q '^#!'; then
+          echo "::error::Downloaded install.sh is empty or not a valid script"
           exit 1
         fi
+        echo "install.sh sha256: $(sha256sum "$INSTALL_SCRIPT" 2>/dev/null || shasum -a 256 "$INSTALL_SCRIPT")"
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
         safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
-        printf '%s\n' "$safe_install_dir" >> "$GITHUB_PATH"
+        echo "$safe_install_dir" >> "$GITHUB_PATH"
 
     - name: Run Aguara scan
       id: scan
@@ -191,7 +192,7 @@ runs:
 
     - name: Upload SARIF to GitHub Code Scanning
       if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
-      uses: github/codeql-action/upload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
+      uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
       continue-on-error: true
       with:
         sarif_file: ${{ inputs.output }}

@@ -10,21 +10,21 @@
 
 **Harden Agent Version:** `2`
 
-Action **garagon--aguara/v0.24.0** was hardened automatically. 3 finding(s) were identified and resolved across 2 iteration(s).
+Action **garagon--aguara/v0.24.0** was hardened automatically. 3 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### unsafe-shell (severity: high)
 
-The 'Install Aguara' step pipes remote content straight into a shell: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Download install.sh to a file first, then run it as a separate command.
+The 'Install Aguara' step downloads install.sh and pipes it straight into bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. Download the script to a file first, check it (for example with a checksum), then run it as a separate command.
 
 Locations:
 
-- `action.yml:99`
+- `action.yml:98`
 
 ### github-env-injection (severity: high)
 
-The 'Install Aguara' step writes `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` without first running `printf '%s' ... | tr -d '\n\r'`. INSTALL_DIR comes from the step's env block (`${{ runner.temp }}/aguara-bin`), not from a literal computed inside the run script.
+The 'Install Aguara' step writes `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` with no sanitization. INSTALL_DIR comes from a step env: expression (`${{ runner.temp }}/aguara-bin`) rather than a literal computed in the run: block. Strip newlines first: `safe=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')`, then write "$safe".
 
 Locations:
 
@@ -32,7 +32,7 @@ Locations:
 
 ### unpinned-uses (severity: high)
 
-A composite step uses a mutable tag instead of a full commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
+The composite step references an action by a mutable tag instead of a 40-character commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
 
 Locations:
 
@@ -46,13 +46,5 @@ Locations:
 
 **Notes:**
 
-install.sh is now downloaded to a mktemp file with curl -o, checked to be non-empty, run with bash, then removed. It still runs without errexit and without arguments, as upstream did. INSTALL_DIR is passed through printf '%s' | tr -d '\n\r' before being written to GITHUB_PATH. github/codeql-action/upload-sarif@v3 is now pinned to ce5e7eeac396d720fe2d802714996c8ce561e311 # v3.
-
-### Iteration 2
-
-**Fixes applied:** unsafe-shell, github-env-injection
-
-**Notes:**
-
-install.sh is now downloaded to a mktemp file, checked to be non-empty, run with 'bash "$file"' (no args, matching upstream's pipe), then removed. INSTALL_DIR has newlines stripped via printf|tr before it is written to GITHUB_PATH. The ref validation (semver tag or 40-char SHA) is unchanged.
+unsafe-shell: install.sh is now downloaded to a temp file with mktemp and curl -o. The step stops if the file is empty or doesn't start with '#!'. It logs the file's sha256 hash, runs it with 'bash "$file"' (upstream piped it into bash, so no extra options were added) and then deletes it. It still fetches from the same ref, which must be a semver tag or a 40-char SHA. The hash is only logged, not compared to a known value, because the ref changes with each release, so there's no fixed checksum to check against. github-env-injection: newlines are stripped from INSTALL_DIR before it is written to GITHUB_PATH. unpinned-uses: github/codeql-action/upload-sarif is now pinned to 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 (# v3). None of this was run or tested here.
 
