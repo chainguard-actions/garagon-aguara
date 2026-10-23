@@ -16,27 +16,27 @@ Action **garagon--aguara/v0.22.0** was hardened automatically. 3 finding(s) were
 
 ### unsafe-shell (severity: high)
 
-The Install Aguara step downloads a remote script and pipes it straight into bash: curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash. The script should be saved to a file first, checked, and then run.
+Step 'Install Aguara' downloads install.sh with curl and pipes it straight into bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. The ref is checked first (semver tag or 40-char SHA), but the script still runs without being saved to a file and verified. Tags can be moved and no checksum is checked.
 
 Locations:
 
-- `action.yml:71`
+- `action.yml:98`
 
 ### unpinned-uses (severity: high)
 
-A composite step uses a mutable tag instead of a full 40-character commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
+A composite action step uses a mutable tag instead of a full commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
 
 Locations:
 
-- `action.yml:139`
+- `action.yml:168`
 
-### github-env-injection (severity: high)
+### github-env-injection (severity: medium)
 
-The Install Aguara step writes INSTALL_DIR to GITHUB_PATH without sanitizing it first: echo "$INSTALL_DIR" >> "$GITHUB_PATH". INSTALL_DIR comes from the env block (${{ runner.temp }}/aguara-bin), not from a literal computed in the same script. The value should go through printf '%s' "$INSTALL_DIR" | tr -d '\n\r' right before the write.
+Step 'Install Aguara' runs `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` without the `printf '%s' ... | tr -d '\n\r'` sanitization. INSTALL_DIR is set in the step's env: block from `${{ runner.temp }}/aguara-bin`, not computed inside the run: script, so the rule requires sanitization. runner.temp is set by the runner, not by an attacker, so the practical risk is low. That is why this is rated medium instead of the check's default high.
 
 Locations:
 
-- `action.yml:73`
+- `action.yml:100`
 
 ## Iteration Notes
 
@@ -46,11 +46,10 @@ Locations:
 
 **Notes:**
 
-All three findings are fixed in action.yml. Nothing was run or tested.
+All three findings are fixed in action.yml. I didn't run the action afterwards.
 
-- **unsafe-shell:** install.sh is now saved to a temp file with curl -o. The step stops if the file is empty, otherwise runs it with `bash "$file"` and then deletes it. Upstream piped it into a plain `bash` without arguments, so there was no `--` to drop. The installer still gets VERSION, INSTALL_DIR and GITHUB_TOKEN from the env block as before.
-- **unpinned-uses:** github/codeql-action/upload-sarif@v3 is now pinned to `@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3`.
-- **github-env-injection:** INSTALL_DIR goes through `printf '%s' | tr -d '\n\r'` before it is written to $GITHUB_PATH.
-
-One possible problem I left alone: the step decides which install.sh to download from github.action_ref. If someone pins this hardened copy by its own commit SHA, that SHA passes the check but probably doesn't exist in garagon/aguara, so the download would fail. Pinning by a vX.Y.Z tag that matches an upstream release works, and so does setting install-script-ref.
+- **unsafe-shell:** the install step no longer downloads install.sh and pipes it into bash. By default it now runs the install.sh that ships with the action (`$GITHUB_ACTION_PATH/install.sh`), which comes from the same pinned commit, so nothing is fetched at all. If `install-script-ref` is set (the self-testing case), it downloads the script to a temp file and only runs it if the file isn't empty and its first line is `#!/bin/sh`. That check guards against an empty or wrong download, but it isn't a checksum. The ref check (semver tag or 40-char SHA) is unchanged. The script is run with plain `bash "$file"`, as upstream's pipe was; install.sh sets `set -eu` itself.
+- **Side effect of the unsafe-shell fix:** when `install-script-ref` is blank, the ref the consumer pinned (`github.action_ref`) no longer picks which install.sh runs. The bundled copy from that pinned commit is used instead.
+- **unpinned-uses:** `github/codeql-action/upload-sarif` is pinned to commit 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 (# v3).
+- **github-env-injection:** the `GITHUB_PATH` line is now written with `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'`, followed by a newline.
 
