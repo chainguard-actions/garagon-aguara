@@ -114,14 +114,16 @@ runs:
         fi
         INSTALL_SCRIPT="$(mktemp "${RUNNER_TEMP:-/tmp}/aguara-install.XXXXXX.sh")"
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
-          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" -o "$INSTALL_SCRIPT"
-        if [ ! -s "$INSTALL_SCRIPT" ]; then
-          echo "::error::Downloaded install.sh is empty"
+          -o "$INSTALL_SCRIPT" \
+          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
+        if [ ! -s "$INSTALL_SCRIPT" ] || ! head -n1 "$INSTALL_SCRIPT" | grep -q '^#!'; then
+          echo "::error::Downloaded install.sh is empty or not a valid script"
           exit 1
         fi
+        echo "install.sh sha256: $(sha256sum "$INSTALL_SCRIPT" 2>/dev/null || shasum -a 256 "$INSTALL_SCRIPT")"
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
-        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
+        safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
         echo "$safe_install_dir" >> "$GITHUB_PATH"
 
     - name: Run Aguara scan
