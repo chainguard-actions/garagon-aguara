@@ -112,19 +112,13 @@ runs:
           echo "::warning::install-script ref '$INSTALL_REF' is not a semver tag or 40-char SHA; falling back to $DEFAULT_REF"
           INSTALL_REF="$DEFAULT_REF"
         fi
-        # Hardened: run the install.sh bundled with this action (same commit
-        # as the action itself) instead of piping a remote script into bash.
-        INSTALL_SCRIPT="$GITHUB_ACTION_PATH/install.sh"
-        if [ -n "$INSTALL_SCRIPT_REF" ]; then
-          echo "::notice::install-script-ref '$INSTALL_REF' requested; using the install.sh bundled with this action"
-        fi
-        if [ ! -f "$INSTALL_SCRIPT" ]; then
-          echo "::error::bundled install.sh not found at $INSTALL_SCRIPT"
-          exit 1
-        fi
+        INSTALL_SCRIPT="$(mktemp)"
+        curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
+          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" -o "$INSTALL_SCRIPT"
         bash "$INSTALL_SCRIPT"
-        printf '%s' "$INSTALL_DIR" | tr -d '\n\r' >> "$GITHUB_PATH"
-        echo >> "$GITHUB_PATH"
+        rm -f "$INSTALL_SCRIPT"
+        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
+        echo "$safe_install_dir" >> "$GITHUB_PATH"
 
     - name: Run Aguara scan
       id: scan
