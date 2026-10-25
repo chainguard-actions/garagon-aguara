@@ -16,47 +16,49 @@ Action **garagon--aguara/v0.22.1** was hardened automatically. 3 finding(s) were
 
 ### unsafe-shell (severity: high)
 
-The 'Install Aguara' step downloads a remote script and pipes it straight into bash without saving it to a file first: `curl -fsSL --max-time 30 --retry 3 --retry-connrefused "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. The script should be downloaded to a file, checked, and then run as a separate command.
+The 'Install Aguara' step downloads install.sh and pipes it straight to bash: `curl -fsSL ... "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" | bash`. The script runs without first being saved to a file and checked.
 
 Locations:
 
 - `action.yml:98`
 
-### unpinned-uses (severity: high)
-
-A composite step uses a mutable tag instead of a full 40-character commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
-
-Locations:
-
-- `action.yml:168`
-
 ### github-env-injection (severity: high)
 
-The 'Install Aguara' step writes an env-routed value to $GITHUB_PATH without the required sanitization: `echo "$INSTALL_DIR" >> "$GITHUB_PATH"`, where INSTALL_DIR is set from `${{ runner.temp }}/aguara-bin` in the step's env block. The value is not computed inside the run block, so it must go through `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'` before the write.
+The 'Install Aguara' step writes `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` without the `printf '%s' ... | tr -d '\n\r'` cleanup step. INSTALL_DIR comes from the step's env: block (`${{ runner.temp }}/aguara-bin`). It is not a literal computed inside the run block, so it has to be cleaned before it is written to GITHUB_PATH.
 
 Locations:
 
 - `action.yml:100`
 
+### unpinned-uses (severity: high)
+
+The composite action step uses a mutable tag instead of a full commit SHA: `uses: github/codeql-action/upload-sarif@v3`.
+
+Locations:
+
+- `action.yml:168`
+
 ## Iteration Notes
 
 ### Iteration 1
 
-**Fixes applied:** unsafe-shell, unpinned-uses, github-env-injection
+**Fixes applied:** unsafe-shell, github-env-injection, unpinned-uses
 
 **Notes:**
 
-I fixed all three findings in action.yml. Nothing has been run or tested yet.
+I fixed all three findings in action.yml. Nothing was run to test the changes.
 
-- **unsafe-shell:** install.sh is now downloaded to a temp file with the same curl options as before. The step stops with an error if the file is empty. Otherwise it runs the file with `bash "$INSTALL_SCRIPT"` and then deletes it. Upstream passed no arguments to the script, so none are passed now. Apart from the empty-file check, nothing else verifies the download.
-- **unpinned-uses:** I pinned `github/codeql-action/upload-sarif@v3` to `4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3`. I got that commit from a lookup of the v3 tag.
-- **github-env-injection:** `INSTALL_DIR` now goes through `printf '%s' "$INSTALL_DIR" | tr -d '\n\r'` before it is written to `$GITHUB_PATH`.
+1. unsafe-shell: install.sh is no longer piped straight into bash. The step now saves it to a temp file, stops with an error if the file is empty, runs it with `bash "$INSTALL_SCRIPT"` and then deletes it. The empty-file check only catches a blank download; it does not verify the script's contents.
+2. github-env-injection: before writing INSTALL_DIR to GITHUB_PATH, the step now strips newlines and carriage returns with `printf '%s' | tr -d '\n\r'`.
+3. unpinned-uses: `github/codeql-action/upload-sarif` is now pinned to commit 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 (the current v3), with `# v3` kept as a comment.
+
+Unchanged and worth knowing: when this hardened copy runs, the ref the caller pins to (`github.action_ref`) will be the hardened copy's ref, not an aguara release tag. If that ref isn't a vX.Y.Z tag or a 40-character SHA, the step prints a warning and fetches install.sh from v0.22.1, which is the upstream default.
 
 ### Iteration 2
 
-**Fixes applied:** unpinned-uses, invalid-yaml
+**Fixes applied:** unpinned-uses
 
 **Notes:**
 
-Undid the bad edit in the 'Run Aguara scan' run block: put back the closing 'fi', the blank line and the 'echo "findings-count=${count}" >> "$GITHUB_OUTPUT"' line. Pinned github/codeql-action/upload-sarif@v3 to 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3. I got the SHA from lookup_action_sha.
+Pinned github/codeql-action/upload-sarif@v3 to 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3 in action.yml. The other 'uses:' matches are only text inside input descriptions.
 
