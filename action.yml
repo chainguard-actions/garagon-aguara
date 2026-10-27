@@ -112,7 +112,7 @@ runs:
           echo "::warning::install-script ref '$INSTALL_REF' is not a semver tag or 40-char SHA; falling back to $DEFAULT_REF"
           INSTALL_REF="$DEFAULT_REF"
         fi
-        INSTALL_SCRIPT="$(mktemp "${RUNNER_TEMP:-/tmp}/aguara-install.XXXXXX.sh")"
+        INSTALL_SCRIPT="$(mktemp "${RUNNER_TEMP:-/tmp}/aguara-install.XXXXXX")"
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
           -o "$INSTALL_SCRIPT" \
           "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
@@ -123,7 +123,7 @@ runs:
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
         safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
-        printf '%s\n' "$safe_install_dir" >> "$GITHUB_PATH"
+        echo "$safe_install_dir" >> "$GITHUB_PATH"
 
     - name: Run Aguara scan
       id: scan
