@@ -112,12 +112,17 @@ runs:
           echo "::warning::install-script ref '$INSTALL_REF' is not a semver tag or 40-char SHA; falling back to $DEFAULT_REF"
           INSTALL_REF="$DEFAULT_REF"
         fi
-        INSTALL_SCRIPT="$(mktemp)"
+        INSTALL_SCRIPT="$(mktemp "${RUNNER_TEMP:-/tmp}/aguara-install.XXXXXX.sh")"
         curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
-          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh" -o "$INSTALL_SCRIPT"
+          -o "$INSTALL_SCRIPT" \
+          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
+        if [ ! -s "$INSTALL_SCRIPT" ] || ! head -n1 "$INSTALL_SCRIPT" | grep -q '^#!'; then
+          echo "::error::Downloaded install.sh is empty or not a shell script"
+          exit 1
+        fi
         bash "$INSTALL_SCRIPT"
         rm -f "$INSTALL_SCRIPT"
-        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
+        safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
         echo "$safe_install_dir" >> "$GITHUB_PATH"
 
     - name: Run Aguara scan
@@ -174,7 +179,7 @@ runs:
         if [ -f "$INPUT_OUTPUT" ]; then
           if [ "$INPUT_FORMAT" = "sarif" ]; then
             count=$(jq '[.runs[].results | length] | add // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
-          elif [ "$INPUT_FORMAT" = "json" ]; then
+          elif [ "$INPUT_upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3" ]; then
             count=$(jq '.findings | length // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
           fi
         fi
