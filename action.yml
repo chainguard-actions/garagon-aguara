@@ -97,33 +97,24 @@ runs:
         ACTION_REF: ${{ github.action_ref }}
         INSTALL_DIR: ${{ runner.temp }}/aguara-bin
         GITHUB_TOKEN: ${{ github.token }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        # Resolve where install.sh is fetched from. Resolution order:
-        #   1. `with: install-script-ref:` (advanced / self-testing)
-        #   2. `github.action_ref` (what the consumer pinned `@` to)
-        #   3. a baked-in default tag
-        # Anything that isn't a semver tag (vX.Y.Z) or a 40-char SHA is
-        # rejected so we never fetch install.sh from a mutable branch
-        # like `main`, `v1`, or `@branch-name`.
-        DEFAULT_REF="v0.22.0"
-        INSTALL_REF="${INSTALL_SCRIPT_REF:-${ACTION_REF:-$DEFAULT_REF}}"
-        if [[ ! "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
-           [[ ! "$INSTALL_REF" =~ ^[0-9a-f]{40}$ ]]; then
-          echo "::warning::install-script ref '$INSTALL_REF' is not a semver tag or 40-char SHA; falling back to $DEFAULT_REF"
-          INSTALL_REF="$DEFAULT_REF"
+        # Hardened: run the install.sh bundled with this (pinned) action
+        # checkout instead of downloading a script from the internet and
+        # piping it into bash. The bundled script is the same file that
+        # upstream fetched for this ref, and it verifies the release
+        # archive's SHA-256 against checksums.txt before installing.
+        if [ -n "$INSTALL_SCRIPT_REF" ]; then
+          echo "::notice::install-script-ref is ignored; using the install.sh bundled with this action"
         fi
-        INSTALL_SCRIPT="$(mktemp "${RUNNER_TEMP:-/tmp}/aguara-install.XXXXXX.sh")"
-        curl -fsSL --max-time 30 --retry 3 --retry-connrefused \
-          -o "$INSTALL_SCRIPT" \
-          "https://raw.githubusercontent.com/garagon/aguara/${INSTALL_REF}/install.sh"
-        if [ ! -s "$INSTALL_SCRIPT" ] || ! head -n1 "$INSTALL_SCRIPT" | grep -q '^#!'; then
-          echo "::error::Downloaded install.sh is empty or not a shell script"
+        INSTALL_SCRIPT="$ACTION_PATH/install.sh"
+        if [ ! -f "$INSTALL_SCRIPT" ]; then
+          echo "::error::bundled install.sh not found at $INSTALL_SCRIPT"
           exit 1
         fi
         bash "$INSTALL_SCRIPT"
-        rm -f "$INSTALL_SCRIPT"
-        safe_install_dir="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
-        echo "$safe_install_dir" >> "$GITHUB_PATH"
+        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
+        printf '%s\n' "$safe_install_dir" >> "$GITHUB_PATH"
 
     - name: Run Aguara scan
       id: scan
@@ -179,7 +170,7 @@ runs:
         if [ -f "$INPUT_OUTPUT" ]; then
           if [ "$INPUT_FORMAT" = "sarif" ]; then
             count=$(jq '[.runs[].results | length] | add // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
-          elif [ "$INPUT_upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3" ]; then
+          elif [ "$INPUT_FORMAT" = "json" ]; then
             count=$(jq '.findings | length // 0' "$INPUT_OUTPUT" 2>/dev/null || echo 0)
           fi
         fi
