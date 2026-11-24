@@ -1,0 +1,44 @@
+name: Test JSON format on malicious fixture
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/fixtures/malicious
+          format: json
+          output: aguara-results.json
+          upload-sarif: 'false'
+      - name: Assert JSON output file and findings
+        env:
+          COUNT: ${{ steps.action.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "findings-count: $COUNT"
+          echo "exit-code: $EXIT_CODE"
+          if [ ! -f aguara-results.json ]; then
+            echo "FAIL: aguara-results.json not found"
+            exit 1
+          fi
+          if ! jq -e . aguara-results.json > /dev/null; then
+            echo "FAIL: output is not valid JSON"
+            exit 1
+          fi
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "FAIL: expected exit-code 0 without fail-on"
+            exit 1
+          fi
+          if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -lt 1 ]; then
+            echo "FAIL: expected at least one finding"
+            exit 1
+          fi
+          FILE_COUNT=$(jq '.findings | length' aguara-results.json)
+          if [ "$FILE_COUNT" != "$COUNT" ]; then
+            echo "FAIL: output count $COUNT != file count $FILE_COUNT"
+            exit 1
+          fi
+          echo "PASS"

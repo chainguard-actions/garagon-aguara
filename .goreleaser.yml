@@ -1,0 +1,77 @@
+version: 2
+
+builds:
+  - main: ./cmd/aguara
+    binary: aguara
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/garagon/aguara/cmd/aguara/commands.Version={{.Version}}
+      - -X github.com/garagon/aguara/cmd/aguara/commands.Commit={{.ShortCommit}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  # GoReleaser v2.x: `format`/`format_overrides.format` (singular) is
+  # deprecated in favor of `formats`/`format_overrides.formats` (plural
+  # array). The output artifacts are identical; this only updates the
+  # config schema so `goreleaser check` stays clean for future versions.
+  - formats: [tar.gz]
+    name_template: "aguara_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: "checksums.txt"
+
+# Cosign keyless signing of the checksums.txt file. Consumers verify the
+# bundle against the OIDC identity of the GitHub Actions release workflow,
+# then verify each artifact's sha256 against the now-trusted checksums.txt.
+# The .bundle format (cosign 2.x+) packs signature, certificate, and TUF
+# metadata into a single file; the older --output-signature / --output-certificate
+# flags are deprecated and silently ignored when --new-bundle-format is in use.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.bundle"
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "--yes"
+      - "${artifact}"
+    artifacts: checksum
+    output: true
+
+# SPDX SBOMs generated with syft for each release archive. Lets consumers
+# audit the dependency tree without having to recompute it themselves.
+sboms:
+  - artifacts: archive
+
+# GoReleaser v2.x: `brews` is being phased out in favor of
+# `homebrew_casks`. The migration is intentionally NOT done here
+# because it is user-facing: the tap layout moves from
+# `Formula/aguara.rb` to `Casks/aguara.rb`, and `brew install
+# garagon/tap/aguara` becomes a cask install. Tracked for a
+# dedicated migration PR with a deprecation window for tap users.
+brews:
+  - repository:
+      owner: garagon
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/garagon/aguara"
+    description: "Security scanner for AI agent skills and MCP servers"
+    license: "Apache-2.0"
+    test: |
+      system "#{bin}/aguara", "version"
+
+changelog:
+  use: github-native

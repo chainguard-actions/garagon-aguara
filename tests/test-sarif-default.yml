@@ -1,0 +1,39 @@
+name: Test default SARIF format
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/fixtures/malicious
+          upload-sarif: 'false'
+      - name: Assert SARIF output
+        env:
+          COUNT: ${{ steps.action.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "findings-count: $COUNT"
+          echo "exit-code: $EXIT_CODE"
+          if [ ! -f aguara-results.sarif ]; then
+            echo "FAIL: aguara-results.sarif not found"
+            exit 1
+          fi
+          VERSION=$(jq -r '.version' aguara-results.sarif)
+          echo "sarif version: $VERSION"
+          if [ "$VERSION" != "2.1.0" ]; then
+            echo "FAIL: expected SARIF version 2.1.0"
+            exit 1
+          fi
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "FAIL: expected exit-code 0"
+            exit 1
+          fi
+          if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -lt 1 ]; then
+            echo "FAIL: expected at least one finding"
+            exit 1
+          fi
+          echo "PASS"

@@ -1,0 +1,37 @@
+name: Test terminal format to output file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/fixtures/malicious
+          format: terminal
+          output: aguara-report.txt
+          verbose: 'true'
+      - name: Assert terminal report
+        env:
+          COUNT: ${{ steps.action.outputs.findings-count }}
+          EXIT_CODE: ${{ steps.action.outputs.exit-code }}
+        run: |
+          echo "findings-count: $COUNT"
+          echo "exit-code: $EXIT_CODE"
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "FAIL: expected exit-code 0"
+            exit 1
+          fi
+          # findings-count is only computed for sarif/json formats
+          if [ "$COUNT" != "0" ]; then
+            echo "FAIL: expected findings-count 0 for terminal format"
+            exit 1
+          fi
+          if [ ! -s aguara-report.txt ]; then
+            echo "FAIL: aguara-report.txt missing or empty"
+            exit 1
+          fi
+          head -n 40 aguara-report.txt
+          echo "PASS"

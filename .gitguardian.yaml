@@ -1,0 +1,3 @@
+paths-ignore:
+  - "internal/rules/builtin/*.yaml"
+  - "internal/rules/testdata/**"

@@ -1,0 +1,22 @@
+{
+  "manifest_schema": 1,
+  "bundle_schema_version": 1,
+  "blob": "generated_intel.json.gz",
+  "gzip_sha256": "60e099032f5c6892400ece63a35ca143b6c4e99446155cc20740b5ab8819ff4a",
+  "json_sha256": "634c8b20b5800460fb1e3c69a5bf8f67626b8f2f8ce25f3f46c6befeb6261daa",
+  "gzip_bytes": 3680441,
+  "json_bytes": 28643676,
+  "record_count": 39337,
+  "source_count": 8,
+  "ecosystems": [
+    "npm",
+    "PyPI",
+    "Go",
+    "crates.io",
+    "Packagist",
+    "RubyGems",
+    "Maven",
+    "NuGet"
+  ],
+  "generated_at": "2026-11-23T17:31:08.69833046Z"
+}
