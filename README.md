@@ -15,6 +15,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | v0.24.0 | [`v0.24.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.24.0) | [`45caeaa`](https://github.com/garagon/aguara/commit/45caeaa3423b3a9c4fe3399daa70a2dae245f490) | [`HARDENING.md`](https://github.com/chainguard-actions/garagon-aguara/blob/v0.24.0/HARDENING.md) |
 | v0.27.0 | [`v0.27.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.27.0) | [`2ad546a`](https://github.com/garagon/aguara/commit/2ad546a95a03eb81f5255471c500ca326ee5220b) | [`HARDENING.md`](https://github.com/chainguard-actions/garagon-aguara/blob/v0.27.0/HARDENING.md) |
 | v0.28.0 | [`v0.28.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.28.0) | [`d1fbdcb`](https://github.com/garagon/aguara/commit/d1fbdcb07ba24bab2caddf265be4c13e77ef9d45) | [`HARDENING.md`](https://github.com/chainguard-actions/garagon-aguara/blob/v0.28.0/HARDENING.md) |
+| v0.29.0 | [`v0.29.0`](https://github.com/chainguard-actions/garagon-aguara/tree/v0.29.0) | [`0e3699f`](https://github.com/garagon/aguara/commit/0e3699fc90b4d88db77e678265d03b90548bfd9a) | [`HARDENING.md`](https://github.com/chainguard-actions/garagon-aguara/blob/v0.29.0/HARDENING.md) |
 | v1 | [`v1`](https://github.com/chainguard-actions/garagon-aguara/tree/v1) | [`e9f9f6e`](https://github.com/garagon/aguara/commit/e9f9f6e9bc0acc3237830765a870308c2f37e812) | [`HARDENING.md`](https://github.com/chainguard-actions/garagon-aguara/blob/v1/HARDENING.md) |
 
 ## Privacy
