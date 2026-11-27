@@ -191,7 +191,7 @@ runs:
 
     - name: Upload SARIF to GitHub Code Scanning
       if: always() && inputs.format == 'sarif' && inputs['upload-sarif'] == 'true'
-      uses: chainguard-actions/github-codeql-action/upload-sarif@1ad12431ee96fa440cdd788386cb9ff49083a6f3 # v4
+      uses: chainguard-actions/github-codeql-action/upload-sarif@dac3722852ba9a9395423095c80007f1be2964f8 # v4
       continue-on-error: true
       with:
         sarif_file: ${{ inputs.output }}
